@@ -33,5 +33,20 @@ pre-commit install
 
 ## Status
 
-Scaffold only — see PLAN.md's phased roadmap (section 10) for what's next (Phase 0: prototype the
-effects system and distribution parameterization before building app code).
+- **Phase 0 (done):** effects system (logit-space composition) and distribution parameterization
+  (method-of-moments) prototyped and unit-tested in `simulation/distributions.py` and
+  `simulation/effects.py`.
+- **Phase 1 (in progress):** MVP.
+  - Core data objects for every entity in PLAN.md section 3 (`simulation/entities.py`).
+  - Statistical parameter configuration built on Phase 0 (`simulation/config.py`) — pick a
+    distribution family, mean, and variance for lead arrival and deal size; set industry mix,
+    base close probability, and per-industry/per-rep effects.
+  - A vectorized fast-forward generator (`simulation/generation.py`) — currently produces
+    Accounts and Leads; Task/Opportunity generation through the effects system is next.
+  - A Streamlit app (`app/main.py`) with a live distribution-picker sidebar and basic charts —
+    run it with `streamlit run src/funnel_sim/app/main.py`.
+  - A Postgres schema migration (`migrations/0001_initial_schema.sql`) for the event-sourcing
+    model, applied via `storage/schema.py` — not yet wired to the generator (no bulk-COPY write
+    path yet).
+
+See PLAN.md's phased roadmap (section 10) for the rest of what's next.
