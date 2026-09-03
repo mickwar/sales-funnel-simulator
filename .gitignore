@@ -31,6 +31,9 @@ data/
 .coverage
 htmlcov/
 
+# Claude Desktop auto-saves files it sends into this folder
+Claude outputs/
+
 # Editors / OS
 .vscode/
 .idea/

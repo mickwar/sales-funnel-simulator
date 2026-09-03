@@ -21,6 +21,9 @@ dev = [
     "pytest>=8.0",
     "pre-commit>=3.7",
     "nbstripout>=0.7",
+    "ipykernel>=6.29",
+    "nbformat>=5.10",
+    "nbclient>=0.10",
 ]
 shap = [
     "shap>=0.46",
