@@ -33,7 +33,7 @@ from funnel_sim.simulation.distributions import (
     moments_to_params,
     preview_xy,
 )
-from funnel_sim.simulation.entities import Industry
+from funnel_sim.simulation.entities import Industry, TaskType
 
 from .formatting import humanize
 
@@ -125,11 +125,14 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
         ),
     )
 
+    # Lead count is a whole-number-per-day quantity, so the Mean control is itself
+    # integer-stepped, bounded to a realistic 1-100 leads/day range (Phase 1 feedback: "Set the
+    # lead count boundaries for Mean to be between 1 and 100, enforce whole numbers").
     mean_key = f"{key_prefix}_mean"
     if mean_key not in st.session_state:
-        st.session_state[mean_key] = float(np.clip(spec.mean, 0.1, 500.0))
-    st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], 0.1, 500.0))
-    mean = st.slider("Mean", min_value=0.1, max_value=500.0, step=0.5, key=mean_key)
+        st.session_state[mean_key] = int(np.clip(round(spec.mean), 1, 100))
+    st.session_state[mean_key] = int(np.clip(st.session_state[mean_key], 1, 100))
+    mean = st.slider("Mean", min_value=1, max_value=100, step=1, key=mean_key)
 
     variance: float | None
     if family in SINGLE_PARAMETER_FAMILIES:
@@ -141,15 +144,15 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
         _slider_placeholder(f"{key_prefix}_variance_placeholder")
     else:
         var_key = f"{key_prefix}_variance"
-        # Negative Binomial requires variance > mean, so mean + epsilon is the lowest legal
-        # variance; $1000 is a fixed hard cap on the high end -- only the lower bound moves as
-        # the mean slider moves (Phase 1 feedback: "put a hard cap of 1000 ... only allow the
-        # lower bound to change").
-        min_variance = mean + 0.01
-        max_variance = 1000.0
+        # Negative Binomial requires variance > mean, strictly, so the lowest legal *whole
+        # number* is mean + 1; 200 is a fixed hard cap on the high end -- only the lower bound
+        # moves as the mean slider moves (Phase 1 feedback: "Set the upper limit for negative
+        # binomial's variance to be 200, down from 1000. Enforce whole numbers.").
+        min_variance = mean + 1
+        max_variance = 200
         if var_key not in st.session_state:
-            default_variance = spec.variance if (spec.variance and spec.variance > spec.mean) else mean * 2 + 1.0
-            st.session_state[var_key] = float(np.clip(default_variance, min_variance, max_variance))
+            default_variance = spec.variance if (spec.variance and spec.variance > spec.mean) else mean * 2 + 1
+            st.session_state[var_key] = int(np.clip(round(default_variance), min_variance, max_variance))
         # If the mean slider was just dragged past the stored variance (or the fixed cap now
         # sits below it), the current value is no longer valid -- snap it to the new lowest
         # legal value. Otherwise leave whatever value the user already chose untouched (Phase 1
@@ -157,9 +160,9 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
         # to be the lowest legal value").
         if st.session_state[var_key] <= mean:
             st.session_state[var_key] = min_variance
-        st.session_state[var_key] = float(np.clip(st.session_state[var_key], min_variance, max_variance))
+        st.session_state[var_key] = int(np.clip(st.session_state[var_key], min_variance, max_variance))
         variance = st.slider(
-            "Variance", min_value=min_variance, max_value=max_variance, step=0.5, key=var_key
+            "Variance", min_value=min_variance, max_value=max_variance, step=1, key=var_key
         )
 
     try:
@@ -263,6 +266,68 @@ def industry_mix_picker(
 
     st.caption(f"Raw total: {raw_total:.0f}% -> normalized to 100%.")
     return {industry: weight / raw_total for industry, weight in raw.items()}
+
+
+def task_type_mix_picker(
+    activity_type_mix: Mapping[TaskType, float], key_prefix: str = "activity_type_mix"
+) -> dict[TaskType, float]:
+    """Percentage-per-task-type sliders for how a rep's activities split across call / email /
+    meeting / text -- same percentage-based, auto-normalized pattern as `industry_mix_picker`
+    above (Phase 1 feedback: "Update the parameter configuration page with the relevant knobs
+    for these new simulator actions").
+    """
+    st.subheader("Activity type mix")
+    st.caption("Share of rep activities that are each task type.")
+
+    task_types = list(TaskType)
+    raw: dict[TaskType, float] = {}
+    cols = st.columns(2)
+    for i, task_type in enumerate(task_types):
+        default_pct = activity_type_mix.get(task_type, 1.0 / len(task_types)) * 100.0
+        pct_key = f"{key_prefix}_{task_type.value}_pct"
+        if pct_key not in st.session_state:
+            st.session_state[pct_key] = float(np.clip(round(default_pct, 1), 0.0, 100.0))
+        with cols[i % 2]:
+            raw[task_type] = st.slider(
+                humanize(task_type.value),
+                min_value=0.0,
+                max_value=100.0,
+                step=1.0,
+                format="%.0f%%",
+                key=pct_key,
+            )
+
+    raw_total = sum(raw.values())
+    if raw_total <= 0:
+        st.error("At least one task type needs a nonzero weight.")
+        return {task_type: 1.0 / len(task_types) for task_type in task_types}
+
+    st.caption(f"Raw total: {raw_total:.0f}% -> normalized to 100%.")
+    return {task_type: weight / raw_total for task_type, weight in raw.items()}
+
+
+def rep_activity_picker(
+    activity_prob: float, lead_conversion_base_prob: float, key_prefix: str = "rep_activity"
+) -> tuple[float, float]:
+    """Two related knobs for rep activity on open leads: how likely a lead gets touched on any
+    given day, and how likely one touch converts it into an Opportunity (Phase 1 feedback:
+    "Randomize rep activities on those leads ... Such activities should affect the conversion
+    probability ... Allow leads to be converted into opportunities").
+    """
+    st.subheader("Rep activity")
+    activity_prob = pct_slider(
+        "Chance an open lead gets an activity today",
+        activity_prob,
+        key=f"{key_prefix}_activity_prob",
+        min_pct=0.0,
+        max_pct=100.0,
+    )
+    lead_conversion_base_prob = pct_slider(
+        "Chance one activity converts its lead",
+        lead_conversion_base_prob,
+        key=f"{key_prefix}_lead_conversion_base_prob",
+    )
+    return activity_prob, lead_conversion_base_prob
 
 
 def pct_slider(

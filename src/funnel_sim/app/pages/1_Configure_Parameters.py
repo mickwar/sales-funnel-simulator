@@ -26,6 +26,8 @@ from funnel_sim.app.widgets import (
     inject_placeholder_css,
     lead_arrival_picker,
     pct_slider,
+    rep_activity_picker,
+    task_type_mix_picker,
 )
 from funnel_sim.simulation.config import default_config
 
@@ -61,18 +63,31 @@ with close_prob_col:
     st.subheader("Close probability")
     base_close_prob = pct_slider("Base close probability", config.base_close_prob, key="base_close_prob")
 
+st.divider()
+
+activity_type_col, rep_activity_col = st.columns(2)
+with activity_type_col:
+    activity_type_mix = task_type_mix_picker(config.activity_type_mix)
+with rep_activity_col:
+    activity_prob, lead_conversion_base_prob = rep_activity_picker(
+        config.activity_prob, config.lead_conversion_base_prob
+    )
+
 st.session_state.config = replace(
     config,
     lead_arrival=lead_arrival,
     industry_mix=industry_mix,
     deal_size=deal_size,
     base_close_prob=base_close_prob,
+    activity_type_mix=activity_type_mix,
+    activity_prob=activity_prob,
+    lead_conversion_base_prob=lead_conversion_base_prob,
 )
 
 st.divider()
 st.caption(
     "Employee count, ICP-fit score, and revenue band are still fixed internal defaults for "
-    "Phase 1 -- not yet exposed here. Task/Opportunity generation (and the effects that would "
-    "make deal size and close probability actually feed into generated data) is the next "
-    "increment."
+    "Phase 1 -- not yet exposed here. Rep capacity limits aren't modeled yet, so activity "
+    "chance applies uniformly rather than being gated by each rep's remaining capacity, and "
+    "industry/rep-skill effects on close probability are still the next increment."
 )

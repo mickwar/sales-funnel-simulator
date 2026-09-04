@@ -19,7 +19,7 @@ from typing import Mapping
 
 from .distributions import DistributionResult, Family, moments_to_params
 from .effects import Effect
-from .entities import Industry
+from .entities import Industry, TaskType
 
 
 class SimulationConfigError(ValueError):
@@ -84,6 +84,13 @@ def _default_industry_mix() -> dict[Industry, float]:
     return {industry: 1.0 / n for industry in Industry}
 
 
+def _default_activity_type_mix() -> dict[TaskType, float]:
+    # Equal weight across every TaskType (call/email/meeting/text) — same "deliberately neutral
+    # starting point, user-configurable" rationale as _default_industry_mix above.
+    n = len(TaskType)
+    return {task_type: 1.0 / n for task_type in TaskType}
+
+
 @dataclass
 class SimulationConfig:
     """Every statistical parameter that drives one run's data generation.
@@ -103,6 +110,22 @@ class SimulationConfig:
     # the generator can look a row's effect up by its assigned industry or rep.
     industry_effects: Mapping[Industry, Effect] = field(default_factory=dict)
     rep_skill_effects: Mapping[str, Effect] = field(default_factory=dict)
+    # -- Beyond lead creation (PLAN.md section 4's "assign tasks ... sample task outcomes"): the
+    # first increment of simulating rep activity on already-created leads and converting some of
+    # them into Opportunities. See generation.simulate_activities for how these combine.
+    activity_prob: float = 0.3  # chance an open (not yet converted) lead gets a rep activity on
+    # any given simulated day. 0 means leads are created but never worked; 1 means every open
+    # lead gets touched every day.
+    activity_type_mix: Mapping[TaskType, float] = field(default_factory=_default_activity_type_mix)
+    lead_conversion_base_prob: float = 0.05  # baseline chance that *one* activity converts its
+    # lead into an Opportunity, before any task_type_effects shift -- deliberately per-activity,
+    # not per-day, so a lead that never gets touched has exactly 0% chance to convert (PLAN.md
+    # section 1: "activities should affect the conversion probability").
+    # The *true* configured per-task-type effect on lead_conversion_base_prob, in logit space —
+    # same "ground truth a later fitted model should recover" pattern as industry_effects/
+    # rep_skill_effects above, and, like them, empty by default (no task type is favored until a
+    # scenario explicitly configures one) rather than not yet exposed in the picker UI.
+    task_type_effects: Mapping[TaskType, Effect] = field(default_factory=dict)
 
     def validate(self) -> None:
         """Raise SimulationConfigError (or DistributionConfigError, from a nested ParamSpec) if
@@ -132,6 +155,21 @@ class SimulationConfig:
             raise SimulationConfigError("industry_mix weights must all be >= 0.")
         if abs(mix_total - 1.0) > 1e-6:
             raise SimulationConfigError(f"industry_mix weights must sum to 1.0, got {mix_total:.6g}.")
+
+        if not 0.0 <= self.activity_prob <= 1.0:
+            raise SimulationConfigError("activity_prob must be between 0 and 1.")
+        if not 0.0 < self.lead_conversion_base_prob < 1.0:
+            raise SimulationConfigError("lead_conversion_base_prob must be strictly between 0 and 1.")
+
+        activity_mix_total = sum(self.activity_type_mix.values())
+        if not self.activity_type_mix:
+            raise SimulationConfigError("activity_type_mix must not be empty.")
+        if any(weight < 0 for weight in self.activity_type_mix.values()):
+            raise SimulationConfigError("activity_type_mix weights must all be >= 0.")
+        if abs(activity_mix_total - 1.0) > 1e-6:
+            raise SimulationConfigError(
+                f"activity_type_mix weights must sum to 1.0, got {activity_mix_total:.6g}."
+            )
 
         # Resolving each distribution also validates it — surfaces a DistributionConfigError
         # with the same clear, user-facing message the picker widget shows (PLAN.md section 4).
