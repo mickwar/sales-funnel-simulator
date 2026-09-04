@@ -546,13 +546,13 @@ def prob_dist_picker(label: str, spec: ParamSpec, key_prefix: str) -> ParamSpec:
 def days_until_converted_picker(
     spec: ParamSpec, key_prefix: str = "lead_conversion_days"
 ) -> ParamSpec:
-    """Family + a second control (standard deviation, or a low-high range) picker for how many
-    days a lead has before being closed as Unqualified if it hasn't converted -- deliberately
-    built the same way as `lead_arrival_picker` (Phase 1 feedback: "'Average days' should have a
-    selected discrete distribution like lead arrivals ... The UI for this parameter should
-    basically be the same as Lead arrivals"), just over [0, 60] days and offering Negative
-    Binomial / Discrete Uniform rather than lead arrival's three count families (Phase 1
-    feedback: "allow Negative Binomial and Discrete Uniform").
+    """Family + a second control (standard deviation, low-high range, or nothing) picker for how
+    many days a lead has before being closed as Unqualified if it hasn't converted -- built the
+    same way as `lead_arrival_picker` (Phase 1 feedback: "'Average days' should have a selected
+    discrete distribution like lead arrivals ... The UI for this parameter should basically be
+    the same as Lead arrivals"), just over [0, 60] days -- Poisson, Negative Binomial, and
+    Discrete Uniform (Phase 1 feedback: "allow Negative Binomial and Discrete Uniform", on top of
+    Poisson, the original default).
     """
     family_key = f"{key_prefix}_family"
     if family_key not in st.session_state:
@@ -563,7 +563,8 @@ def days_until_converted_picker(
         format_func=lambda f: humanize(f.value),
         key=family_key,
         help=(
-            "Negative Binomial lets you set the mean and standard deviation independently. "
+            "Poisson has one free parameter (variance always equals the mean). Negative "
+            "Binomial adds an independent standard-deviation control for over-dispersed counts. "
             "Discrete Uniform makes every whole number of days in a range equally likely."
         ),
     )
@@ -594,28 +595,34 @@ def days_until_converted_picker(
         st.session_state[mean_key] = int(np.clip(st.session_state[mean_key], 1, 60))
         mean = st.slider("Mean", min_value=1, max_value=60, step=1, key=mean_key)
 
-        # Same Standard-Deviation-not-Variance treatment as lead arrival's Negative Binomial
-        # branch -- 200 is still the fixed hard cap on variance.
-        min_variance = mean + 1
-        max_variance = 200
-        min_sd = float(np.sqrt(min_variance))
-        max_sd = float(np.sqrt(max_variance))
-        sd_key = f"{key_prefix}_sd"
-        if sd_key not in st.session_state:
-            default_variance = (
-                spec.variance
-                if (spec.variance and spec.mean is not None and spec.variance > spec.mean)
-                else mean * 2 + 1
+        if family in SINGLE_PARAMETER_FAMILIES:
+            # Poisson has only one free parameter -- same reasoning as lead_arrival_picker's
+            # Poisson branch: leave a blank spacer so this row still lines up with the
+            # two-parameter branches.
+            _slider_placeholder(f"{key_prefix}_variance_placeholder")
+        else:
+            # Same Standard-Deviation-not-Variance treatment as lead arrival's Negative Binomial
+            # branch -- 200 is still the fixed hard cap on variance.
+            min_variance = mean + 1
+            max_variance = 200
+            min_sd = float(np.sqrt(min_variance))
+            max_sd = float(np.sqrt(max_variance))
+            sd_key = f"{key_prefix}_sd"
+            if sd_key not in st.session_state:
+                default_variance = (
+                    spec.variance
+                    if (spec.variance and spec.mean is not None and spec.variance > spec.mean)
+                    else mean * 2 + 1
+                )
+                default_sd = float(np.sqrt(np.clip(default_variance, min_variance, max_variance)))
+                st.session_state[sd_key] = default_sd
+            if st.session_state[sd_key] ** 2 <= mean:
+                st.session_state[sd_key] = min_sd
+            st.session_state[sd_key] = float(np.clip(st.session_state[sd_key], min_sd, max_sd))
+            sd = st.slider(
+                "Standard deviation", min_value=min_sd, max_value=max_sd, step=0.1, key=sd_key
             )
-            default_sd = float(np.sqrt(np.clip(default_variance, min_variance, max_variance)))
-            st.session_state[sd_key] = default_sd
-        if st.session_state[sd_key] ** 2 <= mean:
-            st.session_state[sd_key] = min_sd
-        st.session_state[sd_key] = float(np.clip(st.session_state[sd_key], min_sd, max_sd))
-        sd = st.slider(
-            "Standard deviation", min_value=min_sd, max_value=max_sd, step=0.1, key=sd_key
-        )
-        variance = sd**2
+            variance = sd**2
 
     spec_result = ParamSpec(family, mean=mean, variance=variance, low=low, high=high)
     try:

@@ -76,9 +76,10 @@ DEAL_SIZE_FAMILIES = (Family.NORMAL, Family.GAMMA, Family.LOGNORMAL, Family.CONT
 
 # Families for "average days until a lead converts" (Phase 1 feedback: "'Average days' should
 # have a selected discrete distribution like lead arrivals ... allow Negative Binomial and
-# Discrete Uniform"). Deliberately a subset of COUNT_FAMILIES, not the full set -- the feedback
-# names exactly these two.
-DAYS_UNTIL_CONVERTED_FAMILIES = (Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM)
+# Discrete Uniform" -- "allow" here means "in addition to Poisson, the original default", not
+# "instead of" -- so this is the same set as COUNT_FAMILIES, just declared separately since the
+# two parameters are conceptually distinct and may not always track each other).
+DAYS_UNTIL_CONVERTED_FAMILIES = (Family.POISSON, Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM)
 
 # Families for the two [0, 1]-domain "probability" parameters -- a lead's base conversion
 # probability and its daily decay factor. Beta was already the only option; Continuous Uniform on
@@ -132,12 +133,8 @@ def _default_conversion_decay() -> ParamSpec:
 
 
 def _default_days_until_converted() -> ParamSpec:
-    # Negative Binomial, mean 5 days, variance 10 (a modest over-dispersion) -- Poisson was the
-    # original default (Phase 1 feedback: "Default to Poisson with a mean of 5"), but Poisson
-    # isn't one of the two families this parameter's own selector offers (see
-    # DAYS_UNTIL_CONVERTED_FAMILIES), so Negative Binomial with the same mean is the closest
-    # equivalent starting point.
-    return ParamSpec(Family.NEGATIVE_BINOMIAL, mean=5.0, variance=10.0)
+    # Poisson, mean 5 days (Phase 1 feedback: "Default to Poisson with a mean of 5").
+    return ParamSpec(Family.POISSON, mean=5.0)
 
 
 @dataclass

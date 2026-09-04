@@ -163,7 +163,7 @@ def test_with_lead_arrival_and_with_deal_size_return_new_configs_without_mutatin
 def test_default_config_has_reasonable_conversion_defaults():
     config = default_config()
     config.validate()  # should not raise
-    assert config.days_until_converted.family is Family.NEGATIVE_BINOMIAL
+    assert config.days_until_converted.family is Family.POISSON
     assert config.days_until_converted.mean == pytest.approx(5.0)
     assert config.base_conversion_prob.family is Family.BETA
     assert config.base_conversion_prob.mean == pytest.approx(0.20)
@@ -171,8 +171,9 @@ def test_default_config_has_reasonable_conversion_defaults():
     assert config.conversion_decay.mean == pytest.approx(0.8)
 
 
-def test_days_until_converted_families_are_negative_binomial_and_discrete_uniform():
+def test_days_until_converted_families_are_poisson_negative_binomial_and_discrete_uniform():
     assert set(DAYS_UNTIL_CONVERTED_FAMILIES) == {
+        Family.POISSON,
         Family.NEGATIVE_BINOMIAL,
         Family.DISCRETE_UNIFORM,
     }
@@ -184,7 +185,7 @@ def test_probability_families_are_beta_and_continuous_uniform():
 
 def test_validate_rejects_non_count_family_for_days_until_converted():
     config = default_config()
-    config.days_until_converted = ParamSpec(Family.POISSON, mean=5.0)
+    config.days_until_converted = ParamSpec(Family.NORMAL, mean=5.0, variance=4.0)
     with pytest.raises(SimulationConfigError, match="days_until_converted must use one of"):
         config.validate()
 
