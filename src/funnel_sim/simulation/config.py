@@ -53,8 +53,27 @@ class ParamSpec:
 # Binomial over Poisson when the user wants mean and variance set independently).
 COUNT_FAMILIES = (Family.POISSON, Family.NEGATIVE_BINOMIAL)
 
-# Families appropriate for a strictly-positive continuous quantity like deal size.
-POSITIVE_CONTINUOUS_FAMILIES = (Family.GAMMA, Family.LOGNORMAL)
+# Families offered for deal size. Normal is included (it's the most intuitive to most people)
+# even though its support isn't naturally positive -- `validate_deal_size_spec` below requires a
+# non-negative mean, and actual sampling enforces the $0 floor by rejection (see
+# distributions.sample_positive), never by clamping or shifting the distribution.
+DEAL_SIZE_FAMILIES = (Family.NORMAL, Family.GAMMA, Family.LOGNORMAL)
+
+
+def validate_deal_size_spec(spec: ParamSpec) -> None:
+    """Deal-size-specific validation beyond the generic per-family domain checks
+    `ParamSpec.resolve()` already does. Only Normal needs an extra rule here: Gamma and
+    Lognormal are positive-supported by construction, but Normal's support extends below $0, so
+    a mean that's already negative would mean *most* of the distribution needs to be rejected
+    and redrawn (or, worse, none of it converges) -- requiring mean >= $0 guarantees
+    Pr(X > $0) > 0.5, which is what keeps `distributions.sample_positive`'s rejection loop
+    converging quickly.
+    """
+    if spec.family is Family.NORMAL and spec.mean < 0:
+        raise SimulationConfigError(
+            f"Deal size using Normal needs a mean of $0 or more (got ${spec.mean:,.2f}) so that "
+            "more than half the distribution is already above $0 -- Pr(X > $0) > 0.5."
+        )
 
 
 def _default_industry_mix() -> dict[Industry, float]:
@@ -76,7 +95,7 @@ class SimulationConfig:
 
     seed: int
     lead_arrival: ParamSpec  # leads/day — Poisson or Negative Binomial (see COUNT_FAMILIES).
-    deal_size: ParamSpec  # dollars — Gamma or Lognormal (see POSITIVE_CONTINUOUS_FAMILIES).
+    deal_size: ParamSpec  # dollars — Normal, Gamma, or Lognormal (see DEAL_SIZE_FAMILIES).
     base_close_prob: float = 0.2  # baseline win probability before any effects are applied.
     industry_mix: Mapping[Industry, float] = field(default_factory=_default_industry_mix)
     # True configured effects, in logit space (PLAN.md sections 1/4/6) — what a later fitted
@@ -96,12 +115,13 @@ class SimulationConfig:
                 f"lead_arrival must use a count distribution ({', '.join(f.value for f in COUNT_FAMILIES)}), "
                 f"got {self.lead_arrival.family.value}."
             )
-        if self.deal_size.family not in POSITIVE_CONTINUOUS_FAMILIES:
+        if self.deal_size.family not in DEAL_SIZE_FAMILIES:
             raise SimulationConfigError(
-                "deal_size must use a positive continuous distribution "
-                f"({', '.join(f.value for f in POSITIVE_CONTINUOUS_FAMILIES)}), "
+                "deal_size must use one of "
+                f"({', '.join(f.value for f in DEAL_SIZE_FAMILIES)}), "
                 f"got {self.deal_size.family.value}."
             )
+        validate_deal_size_spec(self.deal_size)
         if not 0.0 < self.base_close_prob < 1.0:
             raise SimulationConfigError("base_close_prob must be strictly between 0 and 1.")
 
@@ -132,10 +152,16 @@ class SimulationConfig:
 def default_config(seed: int = 42) -> SimulationConfig:
     """A reasonable out-of-the-box config so the app/tests can fast-forward without the user
     (or a test) configuring every parameter by hand first.
+
+    deal_size defaults to Normal — of the offered families it's the one most people already
+    have an intuition for, so it's the friendliest starting point even though Gamma/Lognormal
+    are the "naturally positive" choices. lead_arrival can't default to Normal the same way
+    (count data needs a count distribution — see COUNT_FAMILIES), so it defaults to Poisson,
+    the simpler of the two count families.
     """
     return SimulationConfig(
         seed=seed,
         lead_arrival=ParamSpec(Family.POISSON, mean=20.0),
-        deal_size=ParamSpec(Family.LOGNORMAL, mean=8_000.0, variance=16_000_000.0),
+        deal_size=ParamSpec(Family.NORMAL, mean=8_000.0, variance=3_000.0**2),
         base_close_prob=0.2,
     )

@@ -188,18 +188,27 @@ def fast_forward(
     start_day: int = 0,
     seed: int | None = None,
     run_id: str | None = None,
+    rng: np.random.Generator | None = None,
 ) -> FastForwardResult:
     """Advance the simulation `days` daily ticks, starting at `start_day`, and return the
     concatenated Accounts/Leads generated across all of them.
 
-    Seeds a fresh `numpy.random.Generator` from `seed` (falling back to `config.seed` — PLAN.md
-    section 11: "seed the RNG per run so a saved scenario can be reproduced or audited later").
-    Reusing the same seed and config reproduces byte-identical output.
+    By default, seeds a fresh `numpy.random.Generator` from `seed` (falling back to
+    `config.seed` — PLAN.md section 11: "seed the RNG per run so a saved scenario can be
+    reproduced or audited later"). Reusing the same seed and config reproduces byte-identical
+    output.
+
+    Pass an existing `rng` (e.g. one kept in `st.session_state` between "Fast forward" clicks) to
+    *continue* a run instead: the generator draws its next values from wherever that Generator's
+    stream already is, so repeated calls behave like one continuous simulation appending new days
+    rather than replaying the same draws from scratch. When `rng` is given, `seed`/`config.seed`
+    are ignored for this call (the Generator has already been seeded, by the caller, once).
     """
     if days < 1:
         raise ValueError("days must be >= 1.")
 
-    rng = np.random.default_rng(seed if seed is not None else config.seed)
+    if rng is None:
+        rng = np.random.default_rng(seed if seed is not None else config.seed)
     resolved_run_id = run_id if run_id is not None else str(uuid4())
     account_frames: list[pd.DataFrame] = []
     lead_frames: list[pd.DataFrame] = []

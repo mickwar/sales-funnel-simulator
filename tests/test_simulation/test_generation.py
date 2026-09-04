@@ -119,6 +119,66 @@ def test_fast_forward_rejects_fewer_than_one_day():
         fast_forward(config, days=0)
 
 
+def test_fast_forward_with_a_shared_rng_appends_instead_of_replaying():
+    # Two calls sharing one rng object should draw *different* leads-per-day counts than a fresh
+    # seeded-from-scratch call would (Phase 1 feedback: "Fast forward should append to the
+    # previously generated runs, not overwrite them") -- contrast with two independently
+    # fresh-seeded calls (rng=None both times), which *do* replay identical draws.
+    config = _config_with_guaranteed_leads()
+    shared_rng = np.random.default_rng(42)
+
+    first = fast_forward(config, days=3, start_day=0, rng=shared_rng, run_id="run-continued")
+    second = fast_forward(config, days=3, start_day=3, rng=shared_rng, run_id="run-continued")
+
+    assert set(first.leads["created_at_sim_day"]) == set(range(0, 3))
+    assert set(second.leads["created_at_sim_day"]) == set(range(3, 6))
+
+    # Two *fresh*-seeded calls (no shared rng) with the same seed replay the exact same draws --
+    # this is the "overwrite" behavior the shared-rng path is meant to avoid.
+    replay_a = fast_forward(config, days=3, start_day=0, seed=42, run_id="run-continued")
+    replay_b = fast_forward(config, days=3, start_day=0, seed=42, run_id="run-continued")
+    pd.testing.assert_series_equal(
+        replay_a.leads.groupby("created_at_sim_day").size(),
+        replay_b.leads.groupby("created_at_sim_day").size(),
+    )
+    # The shared-rng continuation's second batch is a genuinely new slice of the stream, not a
+    # replay of the first batch's counts.
+    first_counts = first.leads.groupby("created_at_sim_day").size().to_numpy()
+    second_counts = second.leads.groupby("created_at_sim_day").size().to_numpy()
+    assert not np.array_equal(first_counts, second_counts)
+
+
+def test_fast_forward_with_a_shared_rng_reuses_the_given_run_id_across_calls():
+    config = _config_with_guaranteed_leads()
+    shared_rng = np.random.default_rng(7)
+
+    first = fast_forward(config, days=2, start_day=0, rng=shared_rng, run_id="run-continued")
+    second = fast_forward(config, days=2, start_day=2, rng=shared_rng, run_id=first.run_id)
+
+    assert first.run_id == "run-continued"
+    assert second.run_id == first.run_id
+    assert (first.leads["run_id"] == "run-continued").all()
+    assert (second.leads["run_id"] == "run-continued").all()
+
+
+def test_fast_forward_two_calls_sharing_an_rng_matches_one_combined_call():
+    # Splitting one continuous rng stream across two `fast_forward` calls (3 days, then 3 more)
+    # should be indistinguishable from consuming that same stream in a single 6-day call -- proof
+    # that "append" really does continue the simulation rather than skipping or repeating draws.
+    config = _config_with_guaranteed_leads()
+
+    shared_rng = np.random.default_rng(99)
+    part_a = fast_forward(config, days=3, start_day=0, rng=shared_rng, run_id="run-x")
+    part_b = fast_forward(config, days=3, start_day=3, rng=shared_rng, run_id="run-x")
+    continued_leads_by_day = pd.concat([part_a.leads, part_b.leads], ignore_index=True)
+
+    one_shot = fast_forward(config, days=6, start_day=0, seed=99, run_id="run-x")
+
+    continued_counts = continued_leads_by_day.groupby("created_at_sim_day").size().sort_index()
+    one_shot_counts = one_shot.leads.groupby("created_at_sim_day").size().sort_index()
+    pd.testing.assert_series_equal(continued_counts, one_shot_counts)
+
+
 def test_industry_mix_is_respected_at_scale():
     # Skew heavily toward SAAS and check the sampled distribution roughly matches -- a
     # statistical (not exact) check, so keep n large and the tolerance loose to avoid flakiness.

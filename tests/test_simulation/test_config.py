@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from funnel_sim.simulation.config import (
+    DEAL_SIZE_FAMILIES,
     ParamSpec,
     SimulationConfig,
     SimulationConfigError,
     default_config,
+    validate_deal_size_spec,
 )
 from funnel_sim.simulation.distributions import DistributionConfigError, Family
 from funnel_sim.simulation.entities import Industry
@@ -19,7 +21,7 @@ def test_default_config_is_valid_out_of_the_box():
     config = default_config()
     config.validate()  # should not raise
     assert config.lead_arrival.family is Family.POISSON
-    assert config.deal_size.family is Family.LOGNORMAL
+    assert config.deal_size.family is Family.NORMAL  # most intuitive default (Phase 1 feedback)
     assert config.industry_mix[Industry.SAAS] == pytest.approx(1.0 / len(Industry))
 
 
@@ -43,11 +45,37 @@ def test_validate_rejects_non_count_family_for_lead_arrival():
         bad.validate()
 
 
-def test_validate_rejects_non_positive_continuous_family_for_deal_size():
+def test_validate_rejects_non_deal_size_family_for_deal_size():
     config = default_config()
     bad = config.with_deal_size(Family.POISSON, mean=5.0, variance=None)
-    with pytest.raises(SimulationConfigError, match="deal_size must use a positive continuous"):
+    with pytest.raises(SimulationConfigError, match="deal_size must use one of"):
         bad.validate()
+
+
+def test_deal_size_families_include_normal_gamma_and_lognormal():
+    assert set(DEAL_SIZE_FAMILIES) == {Family.NORMAL, Family.GAMMA, Family.LOGNORMAL}
+
+
+def test_validate_deal_size_spec_rejects_negative_normal_mean():
+    with pytest.raises(SimulationConfigError, match=r"mean of \$0 or more"):
+        validate_deal_size_spec(ParamSpec(Family.NORMAL, mean=-100.0, variance=1000.0))
+
+
+def test_validate_deal_size_spec_accepts_zero_or_positive_normal_mean():
+    validate_deal_size_spec(ParamSpec(Family.NORMAL, mean=0.0, variance=1000.0))  # no raise
+    validate_deal_size_spec(ParamSpec(Family.NORMAL, mean=5000.0, variance=1000.0))  # no raise
+
+
+def test_validate_deal_size_spec_ignores_mean_sign_for_non_normal_families():
+    # Gamma/Lognormal already require mean > 0 at the distributions.py layer (resolve() would
+    # catch a non-positive mean there); validate_deal_size_spec itself only special-cases Normal.
+    validate_deal_size_spec(ParamSpec(Family.GAMMA, mean=100.0, variance=50.0))  # no raise
+
+
+def test_validate_config_with_normal_deal_size_and_negative_mean_raises():
+    config = default_config().with_deal_size(Family.NORMAL, mean=-50.0, variance=100.0)
+    with pytest.raises(SimulationConfigError, match=r"mean of \$0 or more"):
+        config.validate()
 
 
 @pytest.mark.parametrize("bad_prob", [0.0, 1.0, -0.1, 1.5])
@@ -95,7 +123,7 @@ def test_with_lead_arrival_and_with_deal_size_return_new_configs_without_mutatin
 
     updated2 = config.with_deal_size(Family.GAMMA, mean=6000.0, variance=2_000_000.0)
     assert updated2.deal_size.family is Family.GAMMA
-    assert config.deal_size.family is Family.LOGNORMAL
+    assert config.deal_size.family is Family.NORMAL  # original untouched
 
 
 def test_industry_and_rep_skill_effects_are_plain_effect_instances():

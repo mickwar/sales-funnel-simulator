@@ -16,6 +16,7 @@ from funnel_sim.simulation.distributions import (
     Family,
     moments_to_params,
     preview_xy,
+    sample_positive,
 )
 
 
@@ -130,3 +131,65 @@ def test_discrete_preview_pmf_sums_to_roughly_one(family, mean, variance):
     assert np.all(x == np.round(x))  # integer support
     assert np.all(y >= 0)
     assert y.sum() == pytest.approx(0.999, abs=0.01)
+
+
+def test_preview_xy_with_lower_bound_only_covers_x_above_the_bound():
+    result = moments_to_params(Family.NORMAL, mean=100.0, variance=50.0**2)
+    x, y = preview_xy(result, lower_bound=0.0)
+    assert x.min() >= 0.0
+    assert np.all(y >= 0)
+    # The truncated density is renormalized -- it should integrate to roughly 1 over the shown
+    # range, same as the untruncated preview does (not to Pr(X > 0), which is < 1).
+    area = np.trapezoid(y, x)
+    assert area == pytest.approx(1.0, abs=0.02)
+
+
+@pytest.mark.parametrize(
+    "family, mean, variance",
+    [
+        (Family.GAMMA, 3.0, 1.5),
+        (Family.LOGNORMAL, 5.0, 3.0),
+    ],
+)
+def test_preview_xy_with_lower_bound_zero_is_unchanged_for_already_positive_families(family, mean, variance):
+    # Gamma/Lognormal already have Pr(X > 0) ~= 1, so truncating at 0 shouldn't meaningfully
+    # reshape the curve.
+    result = moments_to_params(family, mean, variance)
+    x_plain, y_plain = preview_xy(result)
+    x_truncated, y_truncated = preview_xy(result, lower_bound=0.0)
+    assert x_truncated[0] == pytest.approx(0.0, abs=1e-6)
+    assert x_plain[-1] == pytest.approx(x_truncated[-1], rel=0.01)
+    assert y_plain[-1] == pytest.approx(y_truncated[-1], rel=0.01)
+
+
+def test_preview_xy_raises_when_almost_nothing_is_above_the_bound():
+    # Mean far below the bound -- virtually none of the mass is above it.
+    result = moments_to_params(Family.NORMAL, mean=-1000.0, variance=10.0)
+    with pytest.raises(DistributionConfigError, match="nothing meaningful to preview"):
+        preview_xy(result, lower_bound=0.0)
+
+
+def test_sample_positive_only_returns_values_above_the_bound():
+    result = moments_to_params(Family.NORMAL, mean=100.0, variance=50.0**2)
+    rng = np.random.default_rng(0)
+    samples = sample_positive(result, size=5_000, rng=rng, lower_bound=0.0)
+    assert len(samples) == 5_000
+    assert np.all(samples > 0.0)
+
+
+def test_sample_positive_matches_the_truncated_distributions_moments():
+    # Pr(X > 0) is comfortably > 0.5 here, so this should converge in very few rounds and the
+    # accepted values should look like draws from the analytically truncated Normal.
+    result = moments_to_params(Family.NORMAL, mean=8_000.0, variance=3_000.0**2)
+    rng = np.random.default_rng(1)
+    samples = sample_positive(result, size=50_000, rng=rng, lower_bound=0.0)
+    assert np.all(samples > 0.0)
+    assert samples.mean() == pytest.approx(result.dist.mean(), rel=0.05)
+
+
+def test_sample_positive_raises_when_it_cannot_converge():
+    # Mean far below the bound -- essentially nothing to accept, so max_rounds is exhausted.
+    result = moments_to_params(Family.NORMAL, mean=-1000.0, variance=10.0)
+    rng = np.random.default_rng(0)
+    with pytest.raises(DistributionConfigError, match="Could not draw"):
+        sample_positive(result, size=10, rng=rng, lower_bound=0.0, max_rounds=3)
