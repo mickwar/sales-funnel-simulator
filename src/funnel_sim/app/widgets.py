@@ -38,14 +38,22 @@ from funnel_sim.simulation.entities import Industry
 from .formatting import humanize
 
 
-def _slider_placeholder() -> None:
-    """Reserve roughly the same vertical footprint as an `st.slider` (label + track) so a
-    single-parameter family (e.g. Poisson, with no variance control) doesn't leave its column
-    shorter than a two-parameter family's -- keeping side-by-side columns' rows (and, in turn,
-    their preview charts) lined up (Phase 1 feedback: "add a blank space for where a second
-    parameter would normally go").
+def _slider_placeholder(key: str) -> None:
+    """Reserve *exactly* the vertical footprint an `st.slider` takes here, so a single-parameter
+    family (e.g. Poisson, with no variance control) doesn't leave its column shorter than a
+    two-parameter family's -- keeping side-by-side columns' rows (and, in turn, their preview
+    charts) lined up (Phase 1 feedback: "add a blank space for where a second parameter would
+    normally go").
+
+    A hardcoded pixel height drifts out of sync with the real slider it's supposed to match
+    (label wrapping, theme, Streamlit version). Instead, render an actual disabled `st.slider`
+    -- guaranteed identical layout to a real one -- and hide it with `visibility: hidden` rather
+    than `display: none`, which removes it from view without collapsing the space it reserves.
+    Passing `key=` gives the widget's wrapper a stable `st-key-<key>` CSS class (Streamlit
+    feature) to target.
     """
-    st.markdown("<div style='height: 58px'></div>", unsafe_allow_html=True)
+    st.slider("Variance", min_value=0.0, max_value=1.0, value=0.0, key=key, disabled=True)
+    st.markdown(f"<style>div.st-key-{key} {{ visibility: hidden; }}</style>", unsafe_allow_html=True)
 
 
 def _render_preview(resolved, lower_bound: float | None = None) -> None:
@@ -102,20 +110,28 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
         # parameter"). Leave a blank spacer in its place so this column's rows still line up
         # with a two-parameter family's (e.g. deal size) in a side-by-side layout.
         variance = None
-        _slider_placeholder()
+        _slider_placeholder(f"{key_prefix}_variance_placeholder")
     else:
         var_key = f"{key_prefix}_variance"
-        default_variance = spec.variance if (spec.variance and spec.variance > spec.mean) else mean * 2 + 1.0
+        # Negative Binomial requires variance > mean, so mean + epsilon is the lowest legal
+        # variance; $1000 is a fixed hard cap on the high end -- only the lower bound moves as
+        # the mean slider moves (Phase 1 feedback: "put a hard cap of 1000 ... only allow the
+        # lower bound to change").
+        min_variance = mean + 0.01
+        max_variance = 1000.0
         if var_key not in st.session_state:
-            st.session_state[var_key] = float(default_variance)
-        # Negative Binomial requires variance > mean. If the mean slider was just dragged past
-        # the stored variance, auto-bump variance to match rather than stranding the widgets on
-        # an invalid combination (Phase 1 feedback, explicitly requested for this case).
+            default_variance = spec.variance if (spec.variance and spec.variance > spec.mean) else mean * 2 + 1.0
+            st.session_state[var_key] = float(np.clip(default_variance, min_variance, max_variance))
+        # If the mean slider was just dragged past the stored variance (or the fixed cap now
+        # sits below it), the current value is no longer valid -- snap it to the new lowest
+        # legal value. Otherwise leave whatever value the user already chose untouched (Phase 1
+        # feedback: "variance stays the same unless it became invalid, in which case update it
+        # to be the lowest legal value").
         if st.session_state[var_key] <= mean:
-            st.session_state[var_key] = mean + max(mean * 0.5, 1.0)
-        max_variance = max(mean * 10.0, st.session_state[var_key], 20.0)
+            st.session_state[var_key] = min_variance
+        st.session_state[var_key] = float(np.clip(st.session_state[var_key], min_variance, max_variance))
         variance = st.slider(
-            "Variance", min_value=mean + 0.01, max_value=max_variance, step=0.5, key=var_key
+            "Variance", min_value=min_variance, max_value=max_variance, step=0.5, key=var_key
         )
 
     try:
