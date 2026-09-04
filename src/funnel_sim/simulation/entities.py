@@ -108,7 +108,18 @@ class Account:
 
 @dataclass
 class Lead:
-    """An individual/contact tied to an Account, with a lifecycle stage (PLAN.md section 3)."""
+    """An individual/contact tied to an Account, with a lifecycle stage (PLAN.md section 3).
+
+    `days_until_converted`, `base_conversion_prob`, `conversion_decay`, and `deal_size` are all
+    drawn once, when the Lead is generated (see `generation.generate_day`) -- not derived from
+    any later activity. `conversion_prob` is the *current* probability, which starts equal to
+    `base_conversion_prob` and then evolves daily: decayed multiplicatively by
+    `conversion_decay` each day the Lead doesn't convert, and nudged (positively or negatively)
+    by whatever `task_type_effects` apply when a rep activity happens to it (PLAN.md/Phase 1
+    feedback: "the chance of a lead being converted should not depend on the outcome of any
+    particular activity[, but] activities... can affect the probability"). A Lead that reaches
+    `days_until_converted` days old without converting moves to DISQUALIFIED.
+    """
 
     run_id: str
     account_id: str
@@ -118,6 +129,13 @@ class Lead:
     # rep-performance adjustment later (PLAN.md section 6: "stratify by ICP-fit/lead source").
     assigned_rep_id: str | None = None
     updated_at_sim_day: int = 0
+    days_until_converted: int = 0  # 0 means it must convert (or be disqualified) the same day.
+    base_conversion_prob: float = 0.0  # this Lead's starting conversion probability (0-1).
+    conversion_decay: float = 1.0  # daily multiplicative decay applied while unconverted (0-1).
+    conversion_prob: float = 0.0  # this Lead's *current* conversion probability (0-1) -- starts
+    # equal to base_conversion_prob, then decays/shifts daily (see class docstring).
+    deal_size: float = 0.0  # this Lead's deal size if/when it converts into an Opportunity --
+    # drawn once at creation so the same lead always carries the same potential deal size.
     lead_id: str = field(default_factory=_new_id)
 
 

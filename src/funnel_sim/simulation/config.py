@@ -8,8 +8,9 @@ close probability — into one value the fast-forward generator (`generation.py`
 and that a later fitted model's estimates get compared against.
 
 Built directly on Phase 0's `distributions` and `effects` modules rather than duplicating their
-logic: `ParamSpec` wraps a (family, mean, variance) config and resolves it via
-`distributions.moments_to_params`; effects stay plain `effects.Effect` instances.
+logic: `ParamSpec` wraps a (family, mean, variance) config -- or, for the two Uniform families, a
+(family, low, high) config -- and resolves it via `distributions.moments_to_params` /
+`distributions.uniform_from_bounds`; effects stay plain `effects.Effect` instances.
 """
 
 from __future__ import annotations
@@ -17,7 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Mapping
 
-from .distributions import DistributionResult, Family, moments_to_params
+from .distributions import (
+    DistributionResult,
+    Family,
+    UNIFORM_FAMILIES,
+    moments_to_params,
+    uniform_from_bounds,
+)
 from .effects import Effect
 from .entities import Industry, TaskType
 
@@ -31,45 +38,53 @@ class SimulationConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ParamSpec:
-    """A user-facing statistical parameter: pick a family, give a mean and (usually) a
-    variance. Thin wrapper around `distributions.moments_to_params` — `resolve()` is where the
-    method-of-moments conversion and domain validation actually happen, so a `ParamSpec` can be
-    stored/passed around cheaply (e.g. in Streamlit's `session_state`) without eagerly building
-    a scipy distribution object.
+    """A user-facing statistical parameter, in one of two shapes: pick a family, give a mean and
+    (usually) a variance -- or, for `DISCRETE_UNIFORM`/`CONTINUOUS_UNIFORM` (see
+    `distributions.UNIFORM_FAMILIES`), give the distribution's low and high endpoints directly
+    instead (a Uniform is already fully determined by its two endpoints, so mean/variance would
+    just be an extra unit-conversion step for the user). `resolve()` dispatches on which shape
+    the family needs -- that's where the actual distribution construction and domain validation
+    happen, so a `ParamSpec` can be stored/passed around cheaply (e.g. in Streamlit's
+    `session_state`) without eagerly building a scipy distribution object.
     """
 
     family: Family
-    mean: float
+    mean: float | None = None
     variance: float | None = None
+    low: float | None = None
+    high: float | None = None
 
     def resolve(self) -> DistributionResult:
-        """Convert to a usable scipy distribution. Raises DistributionConfigError if
-        (family, mean, variance) is outside that family's valid domain — see distributions.py.
+        """Convert to a usable scipy distribution. Raises DistributionConfigError if the
+        configured values are outside that family's valid domain -- see distributions.py.
         """
+        if self.family in UNIFORM_FAMILIES:
+            return uniform_from_bounds(self.family, self.low, self.high)
         return moments_to_params(self.family, self.mean, self.variance)
 
 
 # Families appropriate for a daily arrival-count parameter (PLAN.md section 4: prefer Negative
-# Binomial over Poisson when the user wants mean and variance set independently).
-COUNT_FAMILIES = (Family.POISSON, Family.NEGATIVE_BINOMIAL)
+# Binomial over Poisson when the user wants mean and variance set independently; Discrete
+# Uniform when every count in a range is equally likely).
+COUNT_FAMILIES = (Family.POISSON, Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM)
 
 # Families offered for deal size. Normal is included (it's the most intuitive to most people)
 # even though its support isn't naturally positive -- `validate_deal_size_spec` below requires a
 # non-negative mean, and actual sampling enforces the $0 floor by rejection (see
 # distributions.sample_positive), never by clamping or shifting the distribution.
-DEAL_SIZE_FAMILIES = (Family.NORMAL, Family.GAMMA, Family.LOGNORMAL)
+DEAL_SIZE_FAMILIES = (Family.NORMAL, Family.GAMMA, Family.LOGNORMAL, Family.CONTINUOUS_UNIFORM)
 
 
 def validate_deal_size_spec(spec: ParamSpec) -> None:
     """Deal-size-specific validation beyond the generic per-family domain checks
-    `ParamSpec.resolve()` already does. Only Normal needs an extra rule here: Gamma and
-    Lognormal are positive-supported by construction, but Normal's support extends below $0, so
-    a mean that's already negative would mean *most* of the distribution needs to be rejected
-    and redrawn (or, worse, none of it converges) -- requiring mean >= $0 guarantees
-    Pr(X > $0) > 0.5, which is what keeps `distributions.sample_positive`'s rejection loop
-    converging quickly.
+    `ParamSpec.resolve()` already does. Only Normal needs an extra rule here: Gamma, Lognormal,
+    and Continuous Uniform (whose low endpoint the UI already floors at $50) are positive-
+    supported by construction, but Normal's support extends below $0, so a mean that's already
+    negative would mean *most* of the distribution needs to be rejected and redrawn (or, worse,
+    none of it converges) -- requiring mean >= $0 guarantees Pr(X > $0) > 0.5, which is what
+    keeps `distributions.sample_positive`'s rejection loop converging quickly.
     """
-    if spec.family is Family.NORMAL and spec.mean < 0:
+    if spec.family is Family.NORMAL and spec.mean is not None and spec.mean < 0:
         raise SimulationConfigError(
             f"Deal size using Normal needs a mean of $0 or more (got ${spec.mean:,.2f}) so that "
             "more than half the distribution is already above $0 -- Pr(X > $0) > 0.5."
@@ -91,6 +106,19 @@ def _default_activity_type_mix() -> dict[TaskType, float]:
     return {task_type: 1.0 / n for task_type in TaskType}
 
 
+def _default_base_conversion_prob() -> ParamSpec:
+    # Beta, mean ~20%, sd ~5% (Phase 1 feedback) -- a per-lead starting conversion probability,
+    # not a single global constant, so different leads plausibly convert at different rates.
+    return ParamSpec(Family.BETA, mean=0.20, variance=0.05**2)
+
+
+def _default_conversion_decay() -> ParamSpec:
+    # Beta, mean ~80%, sd ~5% -- each day a lead isn't converted, its probability is multiplied
+    # by a draw from this (Phase 1 feedback: "lower the conversion probability by the decay
+    # (multiplicative)"). Mean close to 1 means decay is gentle by default, not a cliff.
+    return ParamSpec(Family.BETA, mean=0.8, variance=0.05**2)
+
+
 @dataclass
 class SimulationConfig:
     """Every statistical parameter that drives one run's data generation.
@@ -101,8 +129,8 @@ class SimulationConfig:
     """
 
     seed: int
-    lead_arrival: ParamSpec  # leads/day — Poisson or Negative Binomial (see COUNT_FAMILIES).
-    deal_size: ParamSpec  # dollars — Normal, Gamma, or Lognormal (see DEAL_SIZE_FAMILIES).
+    lead_arrival: ParamSpec  # leads/day -- see COUNT_FAMILIES.
+    deal_size: ParamSpec  # dollars -- see DEAL_SIZE_FAMILIES. Sampled once per Lead at creation.
     base_close_prob: float = 0.2  # baseline win probability before any effects are applied.
     industry_mix: Mapping[Industry, float] = field(default_factory=_default_industry_mix)
     # True configured effects, in logit space (PLAN.md sections 1/4/6) — what a later fitted
@@ -117,15 +145,22 @@ class SimulationConfig:
     # any given simulated day. 0 means leads are created but never worked; 1 means every open
     # lead gets touched every day.
     activity_type_mix: Mapping[TaskType, float] = field(default_factory=_default_activity_type_mix)
-    lead_conversion_base_prob: float = 0.05  # baseline chance that *one* activity converts its
-    # lead into an Opportunity, before any task_type_effects shift -- deliberately per-activity,
-    # not per-day, so a lead that never gets touched has exactly 0% chance to convert (PLAN.md
-    # section 1: "activities should affect the conversion probability").
-    # The *true* configured per-task-type effect on lead_conversion_base_prob, in logit space —
-    # same "ground truth a later fitted model should recover" pattern as industry_effects/
-    # rep_skill_effects above, and, like them, empty by default (no task type is favored until a
-    # scenario explicitly configures one) rather than not yet exposed in the picker UI.
+    # The *true* configured per-task-type effect on a lead's conversion probability, in logit
+    # space -- same "ground truth a later fitted model should recover" pattern as
+    # industry_effects/rep_skill_effects above, and, like them, empty by default (no task type is
+    # favored until a scenario explicitly configures one). Applied when an activity happens, but
+    # -- unlike an earlier version of this model -- it nudges the *lead's* ongoing conversion
+    # probability rather than deciding that one activity's outcome (Phase 1 feedback: "the chance
+    # of a lead being converted should not depend on the outcome of any particular activity").
     task_type_effects: Mapping[TaskType, Effect] = field(default_factory=dict)
+    # -- Per-lead conversion timing and probability (Phase 1 feedback): each Lead gets its own
+    # draw of these three when it's generated (see generation.generate_day), not a single global
+    # rate applied to every lead alike.
+    days_until_converted_mean: float = 5.0  # Poisson mean for how many days a lead has to
+    # convert before being closed as Unqualified; day 0 means it must convert the same day it's
+    # created (or be closed unqualified that same day).
+    base_conversion_prob: ParamSpec = field(default_factory=_default_base_conversion_prob)
+    conversion_decay: ParamSpec = field(default_factory=_default_conversion_decay)
 
     def validate(self) -> None:
         """Raise SimulationConfigError (or DistributionConfigError, from a nested ParamSpec) if
@@ -158,8 +193,6 @@ class SimulationConfig:
 
         if not 0.0 <= self.activity_prob <= 1.0:
             raise SimulationConfigError("activity_prob must be between 0 and 1.")
-        if not 0.0 < self.lead_conversion_base_prob < 1.0:
-            raise SimulationConfigError("lead_conversion_base_prob must be strictly between 0 and 1.")
 
         activity_mix_total = sum(self.activity_type_mix.values())
         if not self.activity_type_mix:
@@ -171,20 +204,43 @@ class SimulationConfig:
                 f"activity_type_mix weights must sum to 1.0, got {activity_mix_total:.6g}."
             )
 
+        if self.days_until_converted_mean < 0:
+            raise SimulationConfigError("days_until_converted_mean must be >= 0.")
+        if self.base_conversion_prob.family is not Family.BETA:
+            raise SimulationConfigError("base_conversion_prob must use the Beta distribution.")
+        if self.conversion_decay.family is not Family.BETA:
+            raise SimulationConfigError("conversion_decay must use the Beta distribution.")
+
         # Resolving each distribution also validates it — surfaces a DistributionConfigError
         # with the same clear, user-facing message the picker widget shows (PLAN.md section 4).
         self.lead_arrival.resolve()
         self.deal_size.resolve()
+        self.base_conversion_prob.resolve()
+        self.conversion_decay.resolve()
 
-    def with_lead_arrival(self, family: Family, mean: float, variance: float | None) -> "SimulationConfig":
+    def with_lead_arrival(
+        self,
+        family: Family,
+        mean: float | None = None,
+        variance: float | None = None,
+        low: float | None = None,
+        high: float | None = None,
+    ) -> "SimulationConfig":
         """Return a copy with a new lead_arrival ParamSpec. Doesn't validate — call
         `validate()` (or `resolve()` on the new ParamSpec directly) when you need the error.
         """
-        return replace(self, lead_arrival=ParamSpec(Family(family), mean, variance))
+        return replace(self, lead_arrival=ParamSpec(Family(family), mean, variance, low, high))
 
-    def with_deal_size(self, family: Family, mean: float, variance: float | None) -> "SimulationConfig":
+    def with_deal_size(
+        self,
+        family: Family,
+        mean: float | None = None,
+        variance: float | None = None,
+        low: float | None = None,
+        high: float | None = None,
+    ) -> "SimulationConfig":
         """Return a copy with a new deal_size ParamSpec."""
-        return replace(self, deal_size=ParamSpec(Family(family), mean, variance))
+        return replace(self, deal_size=ParamSpec(Family(family), mean, variance, low, high))
 
 
 def default_config(seed: int = 42) -> SimulationConfig:

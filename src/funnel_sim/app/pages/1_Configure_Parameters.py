@@ -25,6 +25,7 @@ from funnel_sim.app.widgets import (
     industry_mix_picker,
     inject_placeholder_css,
     lead_arrival_picker,
+    lead_conversion_picker,
     pct_slider,
     rep_activity_picker,
     task_type_mix_picker,
@@ -69,9 +70,13 @@ activity_type_col, rep_activity_col = st.columns(2)
 with activity_type_col:
     activity_type_mix = task_type_mix_picker(config.activity_type_mix)
 with rep_activity_col:
-    activity_prob, lead_conversion_base_prob = rep_activity_picker(
-        config.activity_prob, config.lead_conversion_base_prob
-    )
+    activity_prob = rep_activity_picker(config.activity_prob)
+
+st.divider()
+
+days_until_converted_mean, base_conversion_prob, conversion_decay = lead_conversion_picker(
+    config.days_until_converted_mean, config.base_conversion_prob, config.conversion_decay
+)
 
 st.session_state.config = replace(
     config,
@@ -81,7 +86,9 @@ st.session_state.config = replace(
     base_close_prob=base_close_prob,
     activity_type_mix=activity_type_mix,
     activity_prob=activity_prob,
-    lead_conversion_base_prob=lead_conversion_base_prob,
+    days_until_converted_mean=days_until_converted_mean,
+    base_conversion_prob=base_conversion_prob,
+    conversion_decay=conversion_decay,
 )
 
 st.divider()

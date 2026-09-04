@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from funnel_sim.simulation.config import (
+    COUNT_FAMILIES,
     DEAL_SIZE_FAMILIES,
     ParamSpec,
     SimulationConfig,
@@ -52,8 +53,39 @@ def test_validate_rejects_non_deal_size_family_for_deal_size():
         bad.validate()
 
 
-def test_deal_size_families_include_normal_gamma_and_lognormal():
-    assert set(DEAL_SIZE_FAMILIES) == {Family.NORMAL, Family.GAMMA, Family.LOGNORMAL}
+def test_deal_size_families_include_normal_gamma_lognormal_and_continuous_uniform():
+    assert set(DEAL_SIZE_FAMILIES) == {
+        Family.NORMAL,
+        Family.GAMMA,
+        Family.LOGNORMAL,
+        Family.CONTINUOUS_UNIFORM,
+    }
+
+
+def test_count_families_include_poisson_negative_binomial_and_discrete_uniform():
+    assert set(COUNT_FAMILIES) == {
+        Family.POISSON,
+        Family.NEGATIVE_BINOMIAL,
+        Family.DISCRETE_UNIFORM,
+    }
+
+
+def test_param_spec_resolve_handles_discrete_uniform_from_low_and_high():
+    spec = ParamSpec(Family.DISCRETE_UNIFORM, low=0, high=100)
+    result = spec.resolve()
+    assert result.dist.mean() == pytest.approx(50.0)
+
+
+def test_param_spec_resolve_handles_continuous_uniform_from_low_and_high():
+    spec = ParamSpec(Family.CONTINUOUS_UNIFORM, low=50.0, high=10_000.0)
+    result = spec.resolve()
+    assert result.dist.mean() == pytest.approx(5_025.0)
+
+
+def test_param_spec_resolve_rejects_uniform_with_high_not_greater_than_low():
+    spec = ParamSpec(Family.CONTINUOUS_UNIFORM, low=100.0, high=100.0)
+    with pytest.raises(DistributionConfigError, match="must be greater than low"):
+        spec.resolve()
 
 
 def test_validate_deal_size_spec_rejects_negative_normal_mean():
@@ -124,6 +156,45 @@ def test_with_lead_arrival_and_with_deal_size_return_new_configs_without_mutatin
     updated2 = config.with_deal_size(Family.GAMMA, mean=6000.0, variance=2_000_000.0)
     assert updated2.deal_size.family is Family.GAMMA
     assert config.deal_size.family is Family.NORMAL  # original untouched
+
+
+def test_default_config_has_reasonable_conversion_defaults():
+    config = default_config()
+    config.validate()  # should not raise
+    assert config.days_until_converted_mean == pytest.approx(5.0)
+    assert config.base_conversion_prob.family is Family.BETA
+    assert config.base_conversion_prob.mean == pytest.approx(0.20)
+    assert config.conversion_decay.family is Family.BETA
+    assert config.conversion_decay.mean == pytest.approx(0.8)
+
+
+def test_validate_rejects_negative_days_until_converted_mean():
+    config = default_config()
+    config.days_until_converted_mean = -1.0
+    with pytest.raises(SimulationConfigError, match="days_until_converted_mean"):
+        config.validate()
+
+
+def test_validate_rejects_non_beta_family_for_base_conversion_prob():
+    config = default_config()
+    config.base_conversion_prob = ParamSpec(Family.NORMAL, mean=0.2, variance=0.01)
+    with pytest.raises(SimulationConfigError, match="base_conversion_prob must use the Beta"):
+        config.validate()
+
+
+def test_validate_rejects_non_beta_family_for_conversion_decay():
+    config = default_config()
+    config.conversion_decay = ParamSpec(Family.NORMAL, mean=0.8, variance=0.01)
+    with pytest.raises(SimulationConfigError, match="conversion_decay must use the Beta"):
+        config.validate()
+
+
+def test_validate_surfaces_bad_base_conversion_prob_distribution_config():
+    config = default_config()
+    # Beta variance must stay below mean*(1-mean) -- 0.5 is far too large for mean=0.2.
+    config.base_conversion_prob = ParamSpec(Family.BETA, mean=0.2, variance=0.5)
+    with pytest.raises(DistributionConfigError, match="variance must be between"):
+        config.validate()
 
 
 def test_industry_and_rep_skill_effects_are_plain_effect_instances():

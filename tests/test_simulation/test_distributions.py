@@ -17,6 +17,7 @@ from funnel_sim.simulation.distributions import (
     moments_to_params,
     preview_xy,
     sample_positive,
+    uniform_from_bounds,
 )
 
 
@@ -185,6 +186,44 @@ def test_sample_positive_matches_the_truncated_distributions_moments():
     samples = sample_positive(result, size=50_000, rng=rng, lower_bound=0.0)
     assert np.all(samples > 0.0)
     assert samples.mean() == pytest.approx(result.dist.mean(), rel=0.05)
+
+
+def test_uniform_from_bounds_discrete_matches_low_and_high():
+    result = uniform_from_bounds(Family.DISCRETE_UNIFORM, low=0, high=100)
+    assert result.dist.mean() == pytest.approx(50.0)
+    rng = np.random.default_rng(0)
+    samples = result.dist.rvs(size=10_000, random_state=rng)
+    assert samples.min() >= 0
+    assert samples.max() <= 100
+    assert np.all(samples == np.round(samples))
+
+
+def test_uniform_from_bounds_continuous_matches_low_and_high():
+    result = uniform_from_bounds(Family.CONTINUOUS_UNIFORM, low=50.0, high=10_000.0)
+    assert result.dist.mean() == pytest.approx(5_025.0)
+    rng = np.random.default_rng(0)
+    samples = result.dist.rvs(size=10_000, random_state=rng)
+    assert samples.min() >= 50.0
+    assert samples.max() <= 10_000.0
+
+
+def test_uniform_from_bounds_rejects_high_not_greater_than_low():
+    with pytest.raises(DistributionConfigError, match="must be greater than low"):
+        uniform_from_bounds(Family.CONTINUOUS_UNIFORM, low=100.0, high=50.0)
+    with pytest.raises(DistributionConfigError, match="must be greater than low"):
+        uniform_from_bounds(Family.DISCRETE_UNIFORM, low=10, high=10)
+
+
+def test_uniform_from_bounds_preview_and_sample_positive_work_like_other_families():
+    result = uniform_from_bounds(Family.CONTINUOUS_UNIFORM, low=50.0, high=10_000.0)
+    x, y = preview_xy(result)
+    assert x.shape == y.shape
+    assert np.all(y >= 0)
+
+    rng = np.random.default_rng(0)
+    samples = sample_positive(result, size=1_000, rng=rng, lower_bound=0.0)
+    assert len(samples) == 1_000
+    assert np.all(samples > 0.0)
 
 
 def test_sample_positive_raises_when_it_cannot_converge():

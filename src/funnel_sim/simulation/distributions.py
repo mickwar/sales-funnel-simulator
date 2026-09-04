@@ -37,14 +37,21 @@ class Family(str, Enum):
     POISSON = "poisson"
     LOGNORMAL = "lognormal"
     NEGATIVE_BINOMIAL = "negative_binomial"
+    DISCRETE_UNIFORM = "discrete_uniform"
+    CONTINUOUS_UNIFORM = "continuous_uniform"
 
 
 # Families whose support is the non-negative integers (pmf, not pdf; discrete preview x-axis).
-DISCRETE_FAMILIES = frozenset({Family.POISSON, Family.NEGATIVE_BINOMIAL})
+DISCRETE_FAMILIES = frozenset({Family.POISSON, Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM})
 
 # Families with only one free parameter -- variance isn't a meaningful independent input (PLAN.md
 # section 4: Poisson forces variance == mean). The UI hides the variance control for these.
 SINGLE_PARAMETER_FAMILIES = frozenset({Family.POISSON})
+
+# Families parameterized directly by their two endpoints rather than by mean/variance -- see
+# `uniform_from_bounds` below. The UI shows a "Low"/"High" pair instead of "Mean"/"Variance" for
+# these (Phase 1 feedback: "the two parameters should be the left and right endpoints").
+UNIFORM_FAMILIES = frozenset({Family.DISCRETE_UNIFORM, Family.CONTINUOUS_UNIFORM})
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,48 @@ def moments_to_params(family: Family, mean: float, variance: float | None) -> Di
         native_params=params,
         dist=dist,
         warnings=tuple(notes),
+    )
+
+
+def uniform_from_bounds(family: Family, low: float | None, high: float | None) -> DistributionResult:
+    """Build a Discrete- or Continuous-Uniform distribution directly from its two endpoints,
+    rather than via method-of-moments: a Uniform is already fully determined by (low, high), so
+    asking for "mean and variance" instead would just make the user do that low/high -> mean/
+    variance conversion in their head (Phase 1 feedback: "the two parameters should be the left
+    and right endpoints").
+
+    Mirrors `moments_to_params`'s contract: returns the same `DistributionResult` shape (so
+    `preview_xy`/`sample_positive`/etc. all work unmodified), and raises DistributionConfigError
+    -- never silently clamps -- for an out-of-domain (low, high).
+    """
+    family = Family(family)
+    _require(
+        low is not None and high is not None,
+        f"{family.value}: both a low and a high endpoint are required.",
+    )
+    _require(high > low, f"{family.value}: high ({high!r}) must be greater than low ({low!r}).")
+
+    if family is Family.DISCRETE_UNIFORM:
+        lo_i, hi_i = int(round(low)), int(round(high))
+        _require(
+            hi_i > lo_i,
+            f"{family.value}: high and low must differ by at least 1 once rounded to whole numbers.",
+        )
+        dist = stats.randint(lo_i, hi_i + 1)  # scipy randint's high is exclusive -- +1 keeps hi_i.
+        native_params = {"low": float(lo_i), "high": float(hi_i)}
+    elif family is Family.CONTINUOUS_UNIFORM:
+        dist = stats.uniform(loc=float(low), scale=float(high - low))
+        native_params = {"low": float(low), "high": float(high)}
+    else:  # pragma: no cover - only called for the two Uniform families
+        raise DistributionConfigError(f"{family!r} is not a uniform family.")
+
+    return DistributionResult(
+        family=family,
+        mean=float(dist.mean()),
+        variance=float(dist.var()),
+        native_params=native_params,
+        dist=dist,
+        warnings=(),
     )
 
 
