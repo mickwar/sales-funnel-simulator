@@ -6,7 +6,9 @@ import pytest
 
 from funnel_sim.simulation.config import (
     COUNT_FAMILIES,
+    DAYS_UNTIL_CONVERTED_FAMILIES,
     DEAL_SIZE_FAMILIES,
+    PROBABILITY_FAMILIES,
     ParamSpec,
     SimulationConfig,
     SimulationConfigError,
@@ -161,31 +163,50 @@ def test_with_lead_arrival_and_with_deal_size_return_new_configs_without_mutatin
 def test_default_config_has_reasonable_conversion_defaults():
     config = default_config()
     config.validate()  # should not raise
-    assert config.days_until_converted_mean == pytest.approx(5.0)
+    assert config.days_until_converted.family is Family.NEGATIVE_BINOMIAL
+    assert config.days_until_converted.mean == pytest.approx(5.0)
     assert config.base_conversion_prob.family is Family.BETA
     assert config.base_conversion_prob.mean == pytest.approx(0.20)
     assert config.conversion_decay.family is Family.BETA
     assert config.conversion_decay.mean == pytest.approx(0.8)
 
 
-def test_validate_rejects_negative_days_until_converted_mean():
+def test_days_until_converted_families_are_negative_binomial_and_discrete_uniform():
+    assert set(DAYS_UNTIL_CONVERTED_FAMILIES) == {
+        Family.NEGATIVE_BINOMIAL,
+        Family.DISCRETE_UNIFORM,
+    }
+
+
+def test_probability_families_are_beta_and_continuous_uniform():
+    assert set(PROBABILITY_FAMILIES) == {Family.BETA, Family.CONTINUOUS_UNIFORM}
+
+
+def test_validate_rejects_non_count_family_for_days_until_converted():
     config = default_config()
-    config.days_until_converted_mean = -1.0
-    with pytest.raises(SimulationConfigError, match="days_until_converted_mean"):
+    config.days_until_converted = ParamSpec(Family.POISSON, mean=5.0)
+    with pytest.raises(SimulationConfigError, match="days_until_converted must use one of"):
         config.validate()
 
 
-def test_validate_rejects_non_beta_family_for_base_conversion_prob():
+def test_validate_accepts_continuous_uniform_for_base_conversion_prob_and_conversion_decay():
+    config = default_config()
+    config.base_conversion_prob = ParamSpec(Family.CONTINUOUS_UNIFORM, low=0.1, high=0.3)
+    config.conversion_decay = ParamSpec(Family.CONTINUOUS_UNIFORM, low=0.7, high=0.9)
+    config.validate()  # should not raise
+
+
+def test_validate_rejects_non_probability_family_for_base_conversion_prob():
     config = default_config()
     config.base_conversion_prob = ParamSpec(Family.NORMAL, mean=0.2, variance=0.01)
-    with pytest.raises(SimulationConfigError, match="base_conversion_prob must use the Beta"):
+    with pytest.raises(SimulationConfigError, match="base_conversion_prob must use one of"):
         config.validate()
 
 
-def test_validate_rejects_non_beta_family_for_conversion_decay():
+def test_validate_rejects_non_probability_family_for_conversion_decay():
     config = default_config()
     config.conversion_decay = ParamSpec(Family.NORMAL, mean=0.8, variance=0.01)
-    with pytest.raises(SimulationConfigError, match="conversion_decay must use the Beta"):
+    with pytest.raises(SimulationConfigError, match="conversion_decay must use one of"):
         config.validate()
 
 

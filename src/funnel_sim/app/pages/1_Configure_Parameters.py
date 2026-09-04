@@ -74,8 +74,8 @@ with rep_activity_col:
 
 st.divider()
 
-days_until_converted_mean, base_conversion_prob, conversion_decay = lead_conversion_picker(
-    config.days_until_converted_mean, config.base_conversion_prob, config.conversion_decay
+days_until_converted, base_conversion_prob, conversion_decay = lead_conversion_picker(
+    config.days_until_converted, config.base_conversion_prob, config.conversion_decay
 )
 
 st.session_state.config = replace(
@@ -86,7 +86,7 @@ st.session_state.config = replace(
     base_close_prob=base_close_prob,
     activity_type_mix=activity_type_mix,
     activity_prob=activity_prob,
-    days_until_converted_mean=days_until_converted_mean,
+    days_until_converted=days_until_converted,
     base_conversion_prob=base_conversion_prob,
     conversion_decay=conversion_decay,
 )

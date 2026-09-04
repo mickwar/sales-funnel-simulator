@@ -226,6 +226,34 @@ def test_uniform_from_bounds_preview_and_sample_positive_work_like_other_familie
     assert np.all(samples > 0.0)
 
 
+def test_preview_xy_fixed_range_overrides_adaptive_range_for_continuous_uniform():
+    result = uniform_from_bounds(Family.CONTINUOUS_UNIFORM, low=50.0, high=200.0)
+    x, y = preview_xy(result, fixed_range=(0.0, 10_000.0))
+    assert x[0] == pytest.approx(0.0)
+    assert x[-1] == pytest.approx(10_000.0)
+    # Outside the chosen [50, 200] sub-range the density is genuinely 0.
+    assert y[0] == pytest.approx(0.0)
+    assert y[-1] == pytest.approx(0.0)
+
+
+def test_preview_xy_fixed_range_overrides_adaptive_range_for_discrete_uniform():
+    result = uniform_from_bounds(Family.DISCRETE_UNIFORM, low=10, high=20)
+    x, y = preview_xy(result, fixed_range=(0.0, 100.0))
+    assert x[0] == 0
+    assert x[-1] == 100
+    assert y[0] == pytest.approx(0.0)
+    assert y[-1] == pytest.approx(0.0)
+
+
+def test_preview_xy_clamps_beta_pdf_evaluation_near_the_boundaries():
+    # alpha, beta both < 1 here -- the true pdf diverges to +inf approaching 0 and 1.
+    result = moments_to_params(Family.BETA, mean=0.5, variance=0.2)
+    x, y = preview_xy(result, fixed_range=(0.0, 1.0))
+    assert np.all(np.isfinite(y))
+    assert x[0] == pytest.approx(0.0)
+    assert x[-1] == pytest.approx(1.0)
+
+
 def test_sample_positive_raises_when_it_cannot_converge():
     # Mean far below the bound -- essentially nothing to accept, so max_rounds is exhausted.
     result = moments_to_params(Family.NORMAL, mean=-1000.0, variance=10.0)

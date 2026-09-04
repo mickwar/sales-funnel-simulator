@@ -216,7 +216,7 @@ def generate_day(
     module docstring) by sampling `config.lead_arrival` for a count, then drawing that many
     industries from `config.industry_mix`, employee counts / ICP-fit scores from fixed
     distributions, and each new Lead's own `days_until_converted` (`config.
-    days_until_converted_mean`), `base_conversion_prob` (`config.base_conversion_prob`),
+    days_until_converted`), `base_conversion_prob` (`config.base_conversion_prob`),
     `conversion_decay` (`config.conversion_decay`), and `deal_size` (`config.deal_size`, floored
     at $0 via `distributions.sample_positive` the same way the Configure Parameters preview
     promises) -- all in one vectorized pass (no per-lead sampling loop).
@@ -243,7 +243,10 @@ def generate_day(
 
     # Each new Lead's own conversion trajectory -- drawn once here, never resampled later (see
     # entities.Lead's docstring and this module's docstring).
-    days_until_converted = rng.poisson(config.days_until_converted_mean, size=n_new)
+    days_until_converted_dist = config.days_until_converted.resolve().dist
+    days_until_converted = np.maximum(
+        np.round(days_until_converted_dist.rvs(size=n_new, random_state=rng)), 0
+    ).astype(int)
     base_conversion_probs = config.base_conversion_prob.resolve().dist.rvs(size=n_new, random_state=rng)
     conversion_decays = config.conversion_decay.resolve().dist.rvs(size=n_new, random_state=rng)
     deal_sizes = sample_positive(config.deal_size.resolve(), size=n_new, rng=rng)

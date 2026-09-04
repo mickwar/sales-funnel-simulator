@@ -21,7 +21,9 @@ import streamlit as st
 
 from funnel_sim.simulation.config import (
     COUNT_FAMILIES,
+    DAYS_UNTIL_CONVERTED_FAMILIES,
     DEAL_SIZE_FAMILIES,
+    PROBABILITY_FAMILIES,
     ParamSpec,
     SimulationConfigError,
     validate_deal_size_spec,
@@ -85,12 +87,28 @@ def _slider_placeholder(key: str) -> None:
     st.slider("Variance", min_value=0.0, max_value=1.0, value=0.0, key=key, disabled=True)
 
 
-def _render_preview(resolved, lower_bound: float | None = None) -> None:
+def _render_preview(
+    resolved,
+    key: str,
+    lower_bound: float | None = None,
+    fixed_range: tuple[float, float] | None = None,
+) -> None:
     """Render the pdf/pmf preview chart right next to the parameter selection -- users called
     this out as the thing they want to see more of.
+
+    `key` is required and must be unique per call site (it's just passed straight through to
+    `st.plotly_chart`): two pickers can easily end up with pixel-identical preview data -- e.g.
+    two Continuous-Uniform-on-[0,1] pickers both still on their matching defaults -- and without
+    an explicit key, Streamlit's own auto-generated (type + params)-based element id collides in
+    exactly that case.
+
+    `fixed_range`, when given, both drives `preview_xy`'s own x-range (see its docstring) and
+    pins the chart's displayed x-axis to exactly that range -- otherwise Plotly would still
+    auto-fit the axis to whatever data came back, undoing the fixed range (Phase 1 feedback:
+    "the plots should have fixed left and right end points").
     """
     try:
-        x, y = preview_xy(resolved, lower_bound=lower_bound)
+        x, y = preview_xy(resolved, lower_bound=lower_bound, fixed_range=fixed_range)
     except DistributionConfigError as exc:
         st.error(str(exc))
         return
@@ -101,9 +119,56 @@ def _render_preview(resolved, lower_bound: float | None = None) -> None:
         else px.area(chart_df, x="x", y="y")
     )
     fig.update_layout(height=180, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    if fixed_range is not None:
+        fig.update_xaxes(range=list(fixed_range))
+    st.plotly_chart(fig, use_container_width=True, key=key)
     for warning in resolved.warnings:
         st.info(warning)
+
+
+def _range_slider(
+    key: str,
+    default_low: float,
+    default_high: float,
+    domain_lo: float,
+    domain_hi: float,
+    step: float,
+    integer: bool,
+    format: str | None = None,
+) -> tuple[float, float]:
+    """A single two-handle range slider for a Uniform family's (low, high) endpoints -- one
+    widget instead of the earlier separate Low/High sliders (Phase 1 feedback: "update the UI
+    for the uniform distributions to be a single slide bar with two points for the left and
+    right endpoints"). Storing the pair as one `session_state` tuple also retires the old
+    two-slider coupling problem entirely (Low's own `max_value` had to stay strictly below
+    High's `min_value`, which broke down right at the domain's own edges, since Streamlit
+    rejects a slider whose min_value == max_value) -- a single range slider's two handles simply
+    can't cross, so no such edge case exists here.
+    """
+    cast = (lambda v: int(round(v))) if integer else float
+    lo_bound, hi_bound = cast(domain_lo), cast(domain_hi)
+
+    def _clamp_pair(lo: float, hi: float) -> tuple[float, float]:
+        lo = cast(np.clip(lo, lo_bound, hi_bound))
+        hi = cast(np.clip(hi, lo_bound, hi_bound))
+        if hi <= lo:
+            hi = min(lo + step, hi_bound)
+            if hi <= lo:  # domain too narrow for even one step -- shouldn't happen in practice.
+                lo = max(hi - step, lo_bound)
+        return lo, hi
+
+    if key not in st.session_state:
+        st.session_state[key] = _clamp_pair(default_low, default_high)
+    st.session_state[key] = _clamp_pair(*st.session_state[key])
+
+    return st.slider(
+        "Range (low, high)",
+        min_value=lo_bound,
+        max_value=hi_bound,
+        step=step,
+        format=format,
+        key=key,
+    )
 
 
 def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> ParamSpec:
@@ -133,33 +198,29 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
     variance: float | None = None
     low: float | None = None
     high: float | None = None
+    fixed_range: tuple[float, float] | None = None
 
     if family in UNIFORM_FAMILIES:
-        # Lead count is a whole-number-per-day quantity, so both endpoints are integer-stepped,
+        # Lead count is a whole-number-per-day quantity, so the range slider is integer-stepped,
         # bounded 0-100 (Phase 1 feedback: "the lowest value can be 0 and the highest value is
-        # 100") -- only the low endpoint's own slider can reach 0; Poisson/Negative Binomial's
-        # Mean still floors at 1 since their means must be strictly positive.
-        low_key = f"{key_prefix}_low"
-        if low_key not in st.session_state:
-            default_low = spec.low if spec.low is not None else 1
-            st.session_state[low_key] = int(np.clip(round(default_low), 0, 99))
-        # Low's own slider tops out one below the overall 100 cap -- it and High must be
-        # distinct whole numbers, and Streamlit's slider rejects a min_value == max_value, so
-        # High always needs at least one point of headroom above Low (see the min/max clamp
-        # below for how a Low of 99 still resolves to a valid High of exactly 100).
-        st.session_state[low_key] = int(np.clip(st.session_state[low_key], 0, 99))
-        low = st.slider("Low", min_value=0, max_value=99, step=1, key=low_key)
-
-        true_min_high = low + 1  # the mathematically correct lower bound (may be 100 itself).
-        slider_min_high = min(true_min_high, 99)  # keeps High's own min_value < max_value=100.
-        high_key = f"{key_prefix}_high"
-        if high_key not in st.session_state:
-            default_high = spec.high if spec.high is not None else 100
-            st.session_state[high_key] = int(np.clip(round(default_high), true_min_high, 100))
-        if st.session_state[high_key] < true_min_high:
-            st.session_state[high_key] = true_min_high
-        st.session_state[high_key] = int(np.clip(st.session_state[high_key], slider_min_high, 100))
-        high = st.slider("High", min_value=slider_min_high, max_value=100, step=1, key=high_key)
+        # 100").
+        low, high = _range_slider(
+            f"{key_prefix}_range",
+            default_low=spec.low if spec.low is not None else 1,
+            default_high=spec.high if spec.high is not None else 100,
+            domain_lo=0,
+            domain_hi=100,
+            step=1,
+            integer=True,
+        )
+        # The range slider is one row; the Mean+SD branch below is two -- a blank spacer keeps
+        # this column's height matching a two-parameter family's in a side-by-side layout (see
+        # _slider_placeholder's docstring).
+        _slider_placeholder(f"{key_prefix}_variance_placeholder")
+        # When Uniform is selected the preview always spans the full fixed domain, not just the
+        # chosen low-high sub-range (Phase 1 feedback: "in lead arrival, the plot should always
+        # go from x=0 to x=100").
+        fixed_range = (0, 100)
     else:
         # Lead count is a whole-number-per-day quantity, so the Mean control is itself
         # integer-stepped, bounded to a realistic 1-100 leads/day range (Phase 1 feedback: "Set
@@ -211,7 +272,7 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
     spec_result = ParamSpec(family, mean=mean, variance=variance, low=low, high=high)
     try:
         resolved = spec_result.resolve()
-        _render_preview(resolved)
+        _render_preview(resolved, key=f"{key_prefix}_preview", fixed_range=fixed_range)
     except DistributionConfigError as exc:
         st.error(str(exc))
 
@@ -245,35 +306,25 @@ def deal_size_picker(spec: ParamSpec, key_prefix: str = "deal_size") -> ParamSpe
     variance: float | None = None
     low: float | None = None
     high: float | None = None
+    fixed_range: tuple[float, float] | None = None
 
     if family in UNIFORM_FAMILIES:
-        # Hard $0 floor, structurally, same as the other families: both endpoints' sliders are
-        # bounded $50-$10,000 (Phase 1 feedback: "For deal size, the lowest is $50, and the
-        # highest is $10000").
-        low_key = f"{key_prefix}_low"
-        if low_key not in st.session_state:
-            default_low = spec.low if spec.low is not None else 50.0
-            st.session_state[low_key] = float(np.clip(default_low, 50.0, 9_950.0))
-        # Low's own slider tops out one step below the overall $10,000 cap -- same reasoning as
-        # lead arrival's Low/High: Streamlit's slider rejects a min_value == max_value, so High
-        # always needs at least one step of headroom above Low.
-        st.session_state[low_key] = float(np.clip(st.session_state[low_key], 50.0, 9_950.0))
-        low = st.slider(
-            "Low", min_value=50.0, max_value=9_950.0, step=50.0, format="$%.0f", key=low_key
+        # Hard $0 floor, structurally, same as the other families: the range slider is bounded
+        # $50-$10,000 (Phase 1 feedback: "For deal size, the lowest is $50, and the highest is
+        # $10000").
+        low, high = _range_slider(
+            f"{key_prefix}_range",
+            default_low=spec.low if spec.low is not None else 50.0,
+            default_high=spec.high if spec.high is not None else 10_000.0,
+            domain_lo=50.0,
+            domain_hi=10_000.0,
+            step=50.0,
+            integer=False,
+            format="$%.0f",
         )
-
-        true_min_high = low + 50.0  # the mathematically correct lower bound (may be $10,000 itself).
-        slider_min_high = min(true_min_high, 9_950.0)  # keeps High's min_value < max_value=$10,000.
-        high_key = f"{key_prefix}_high"
-        if high_key not in st.session_state:
-            default_high = spec.high if spec.high is not None else 10_000.0
-            st.session_state[high_key] = float(np.clip(default_high, true_min_high, 10_000.0))
-        if st.session_state[high_key] < true_min_high:
-            st.session_state[high_key] = true_min_high
-        st.session_state[high_key] = float(np.clip(st.session_state[high_key], slider_min_high, 10_000.0))
-        high = st.slider(
-            "High", min_value=slider_min_high, max_value=10_000.0, step=50.0, format="$%.0f", key=high_key
-        )
+        _slider_placeholder(f"{key_prefix}_variance_placeholder")
+        # Phase 1 feedback: "for deal size, the plot should always go from x=$50 to x=$10000."
+        fixed_range = (50.0, 10_000.0)
     else:
         # Hard $0 floor, structurally: the mean slider itself never offers a value at or below
         # $0 -- for any of these families -- rather than allowing the selection and catching it
@@ -307,7 +358,9 @@ def deal_size_picker(spec: ParamSpec, key_prefix: str = "deal_size") -> ParamSpe
     try:
         validate_deal_size_spec(spec_result)
         resolved = spec_result.resolve()
-        _render_preview(resolved, lower_bound=0.0)
+        _render_preview(
+            resolved, key=f"{key_prefix}_preview", lower_bound=0.0, fixed_range=fixed_range
+        )
     except (SimulationConfigError, DistributionConfigError) as exc:
         st.error(str(exc))
 
@@ -404,47 +457,170 @@ def rep_activity_picker(activity_prob: float, key_prefix: str = "rep_activity") 
     )
 
 
-def beta_prob_picker(label: str, spec: ParamSpec, key_prefix: str) -> ParamSpec:
-    """Mean + standard-deviation picker locked to the Beta distribution, for a 0-1 probability
-    the user thinks about as a percent -- a lead's base conversion probability, or its daily
-    decay factor (Phase 1 feedback: "Update this so it's a beta distribution"). No family
-    selector here: unlike lead arrival/deal size, these are always Beta, so a dropdown with one
-    fixed option would just be clutter on an already busy page.
+def prob_dist_picker(label: str, spec: ParamSpec, key_prefix: str) -> ParamSpec:
+    """Family + a second control (standard deviation, or a low-high range) picker for a 0-1
+    probability the user thinks about as a percent -- a lead's base conversion probability, or
+    its daily decay factor. Beta was the only option before; Continuous Uniform on [0, 1] was
+    added per Phase 1 feedback ("Distributions should be selectable for Base conversion and
+    Daily decay. Include Beta (already there) as well as Continuous Uniform on [0, 1]").
+
+    `label` names the parameter once, as a caption above the whole picker -- it used to be baked
+    into each slider's own label ("{label} (mean)", "{label} (standard deviation)"), which made
+    it visually appear twice (Phase 1 feedback: "Base conversion probability now appears in two
+    places").
     """
-    default_mean_pct = float(
-        np.clip(round((spec.mean if spec.mean is not None else 0.2) * 100.0, 1), 1.0, 99.0)
-    )
-    mean_key = f"{key_prefix}_mean"
-    if mean_key not in st.session_state:
-        st.session_state[mean_key] = default_mean_pct
-    st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], 1.0, 99.0))
-    mean_pct = st.slider(
-        f"{label} (mean)", min_value=1.0, max_value=99.0, step=0.5, format="%.1f%%", key=mean_key
-    )
-    mean = mean_pct / 100.0
+    st.caption(label)
 
-    # A Beta distribution's variance is capped by mean*(1-mean) -- stay a hair inside that so the
-    # slider itself can never land on an invalid (mean, sd) combination.
-    max_sd_pct = max(float(np.sqrt(mean * (1 - mean)) * 100.0 * 0.98), 0.2)
-    sd_key = f"{key_prefix}_sd"
-    default_sd_pct = float(np.sqrt(spec.variance)) * 100.0 if spec.variance else 5.0
-    if sd_key not in st.session_state:
-        st.session_state[sd_key] = float(np.clip(round(default_sd_pct, 1), 0.1, max_sd_pct))
-    st.session_state[sd_key] = float(np.clip(st.session_state[sd_key], 0.1, max_sd_pct))
-    sd_pct = st.slider(
-        f"{label} (standard deviation)",
-        min_value=0.1,
-        max_value=max_sd_pct,
-        step=0.1,
-        format="%.1f%%",
-        key=sd_key,
+    family_key = f"{key_prefix}_family"
+    if family_key not in st.session_state:
+        st.session_state[family_key] = spec.family
+    family = st.selectbox(
+        "Distribution",
+        list(PROBABILITY_FAMILIES),
+        format_func=lambda f: humanize(f.value),
+        key=family_key,
     )
-    variance = (sd_pct / 100.0) ** 2
 
-    spec_result = ParamSpec(Family.BETA, mean=mean, variance=variance)
+    mean: float | None = None
+    variance: float | None = None
+    low: float | None = None
+    high: float | None = None
+
+    if family in UNIFORM_FAMILIES:
+        low_pct, high_pct = _range_slider(
+            f"{key_prefix}_range_pct",
+            default_low=(spec.low if spec.low is not None else 0.05) * 100.0,
+            default_high=(spec.high if spec.high is not None else 0.95) * 100.0,
+            domain_lo=0.0,
+            domain_hi=100.0,
+            step=0.5,
+            integer=False,
+            format="%.1f%%",
+        )
+        low, high = low_pct / 100.0, high_pct / 100.0
+        _slider_placeholder(f"{key_prefix}_variance_placeholder")
+    else:
+        default_mean_pct = float(
+            np.clip(round((spec.mean if spec.mean is not None else 0.2) * 100.0, 1), 1.0, 99.0)
+        )
+        mean_key = f"{key_prefix}_mean"
+        if mean_key not in st.session_state:
+            st.session_state[mean_key] = default_mean_pct
+        st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], 1.0, 99.0))
+        mean_pct = st.slider(
+            "Mean", min_value=1.0, max_value=99.0, step=0.5, format="%.1f%%", key=mean_key
+        )
+        mean = mean_pct / 100.0
+
+        # A Beta distribution's variance is capped by mean*(1-mean) -- stay a hair inside that so
+        # the slider itself can never land on an invalid (mean, sd) combination.
+        max_sd_pct = max(float(np.sqrt(mean * (1 - mean)) * 100.0 * 0.98), 0.2)
+        sd_key = f"{key_prefix}_sd"
+        default_sd_pct = float(np.sqrt(spec.variance)) * 100.0 if spec.variance else 5.0
+        if sd_key not in st.session_state:
+            st.session_state[sd_key] = float(np.clip(round(default_sd_pct, 1), 0.1, max_sd_pct))
+        st.session_state[sd_key] = float(np.clip(st.session_state[sd_key], 0.1, max_sd_pct))
+        sd_pct = st.slider(
+            "Standard deviation",
+            min_value=0.1,
+            max_value=max_sd_pct,
+            step=0.1,
+            format="%.1f%%",
+            key=sd_key,
+        )
+        variance = (sd_pct / 100.0) ** 2
+
+    spec_result = ParamSpec(family, mean=mean, variance=variance, low=low, high=high)
     try:
         resolved = spec_result.resolve()
-        _render_preview(resolved)
+        # Beta and Uniform(0, 1) are both fixed to the [0, 1] domain by construction, so the
+        # preview always shows that full range (Phase 1 feedback: "when using beta or uniform(0,
+        # 1), the plots should have a fixed x-range from 0 to 1").
+        _render_preview(resolved, key=f"{key_prefix}_preview", fixed_range=(0.0, 1.0))
+    except DistributionConfigError as exc:
+        st.error(str(exc))
+
+    return spec_result
+
+
+def days_until_converted_picker(
+    spec: ParamSpec, key_prefix: str = "lead_conversion_days"
+) -> ParamSpec:
+    """Family + a second control (standard deviation, or a low-high range) picker for how many
+    days a lead has before being closed as Unqualified if it hasn't converted -- deliberately
+    built the same way as `lead_arrival_picker` (Phase 1 feedback: "'Average days' should have a
+    selected discrete distribution like lead arrivals ... The UI for this parameter should
+    basically be the same as Lead arrivals"), just over [0, 60] days and offering Negative
+    Binomial / Discrete Uniform rather than lead arrival's three count families (Phase 1
+    feedback: "allow Negative Binomial and Discrete Uniform").
+    """
+    family_key = f"{key_prefix}_family"
+    if family_key not in st.session_state:
+        st.session_state[family_key] = spec.family
+    family = st.selectbox(
+        "Distribution",
+        list(DAYS_UNTIL_CONVERTED_FAMILIES),
+        format_func=lambda f: humanize(f.value),
+        key=family_key,
+        help=(
+            "Negative Binomial lets you set the mean and standard deviation independently. "
+            "Discrete Uniform makes every whole number of days in a range equally likely."
+        ),
+    )
+
+    mean: float | None = None
+    variance: float | None = None
+    low: float | None = None
+    high: float | None = None
+    fixed_range: tuple[float, float] | None = None
+
+    if family in UNIFORM_FAMILIES:
+        low, high = _range_slider(
+            f"{key_prefix}_range",
+            default_low=spec.low if spec.low is not None else 0,
+            default_high=spec.high if spec.high is not None else 60,
+            domain_lo=0,
+            domain_hi=60,
+            step=1,
+            integer=True,
+        )
+        _slider_placeholder(f"{key_prefix}_variance_placeholder")
+        fixed_range = (0, 60)
+    else:
+        mean_key = f"{key_prefix}_mean"
+        if mean_key not in st.session_state:
+            default_mean = spec.mean if spec.mean is not None else 5
+            st.session_state[mean_key] = int(np.clip(round(default_mean), 1, 60))
+        st.session_state[mean_key] = int(np.clip(st.session_state[mean_key], 1, 60))
+        mean = st.slider("Mean", min_value=1, max_value=60, step=1, key=mean_key)
+
+        # Same Standard-Deviation-not-Variance treatment as lead arrival's Negative Binomial
+        # branch -- 200 is still the fixed hard cap on variance.
+        min_variance = mean + 1
+        max_variance = 200
+        min_sd = float(np.sqrt(min_variance))
+        max_sd = float(np.sqrt(max_variance))
+        sd_key = f"{key_prefix}_sd"
+        if sd_key not in st.session_state:
+            default_variance = (
+                spec.variance
+                if (spec.variance and spec.mean is not None and spec.variance > spec.mean)
+                else mean * 2 + 1
+            )
+            default_sd = float(np.sqrt(np.clip(default_variance, min_variance, max_variance)))
+            st.session_state[sd_key] = default_sd
+        if st.session_state[sd_key] ** 2 <= mean:
+            st.session_state[sd_key] = min_sd
+        st.session_state[sd_key] = float(np.clip(st.session_state[sd_key], min_sd, max_sd))
+        sd = st.slider(
+            "Standard deviation", min_value=min_sd, max_value=max_sd, step=0.1, key=sd_key
+        )
+        variance = sd**2
+
+    spec_result = ParamSpec(family, mean=mean, variance=variance, low=low, high=high)
+    try:
+        resolved = spec_result.resolve()
+        _render_preview(resolved, key=f"{key_prefix}_preview", fixed_range=fixed_range)
     except DistributionConfigError as exc:
         st.error(str(exc))
 
@@ -452,11 +628,11 @@ def beta_prob_picker(label: str, spec: ParamSpec, key_prefix: str) -> ParamSpec:
 
 
 def lead_conversion_picker(
-    days_until_converted_mean: float,
+    days_until_converted: ParamSpec,
     base_conversion_prob: ParamSpec,
     conversion_decay: ParamSpec,
     key_prefix: str = "lead_conversion",
-) -> tuple[float, ParamSpec, ParamSpec]:
+) -> tuple[ParamSpec, ParamSpec, ParamSpec]:
     """Per-lead conversion timing and probability -- assigned once when a Lead is generated, then
     evolves daily (decay) and can be nudged by rep activity (task_type_effects), rather than any
     single activity's outcome directly deciding conversion (Phase 1 feedback: "the chance of a
@@ -467,35 +643,27 @@ def lead_conversion_picker(
     value") -- collapsing the section is the simplest version of that for now.
     """
     with st.expander("Lead conversion timing & decay", expanded=False):
-        mean_key = f"{key_prefix}_days_mean"
-        if mean_key not in st.session_state:
-            st.session_state[mean_key] = float(np.clip(days_until_converted_mean, 0.0, 60.0))
-        st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], 0.0, 60.0))
-        days_mean = st.slider(
-            "Average days until a lead would convert (0 = same-day)",
-            min_value=0.0,
-            max_value=60.0,
-            step=0.5,
-            key=mean_key,
-            help=(
-                "A lead that hasn't converted within this many days of being created is closed "
-                "as Unqualified."
-            ),
+        st.caption(
+            "Average days until a lead would convert (0 = same-day). A lead that hasn't "
+            "converted within its allotted days is closed as Unqualified."
+        )
+        days_until_converted = days_until_converted_picker(
+            days_until_converted, key_prefix=f"{key_prefix}_days"
         )
 
         prob_col, decay_col = st.columns(2)
         with prob_col:
-            base_conversion_prob = beta_prob_picker(
+            base_conversion_prob = prob_dist_picker(
                 "Base conversion probability",
                 base_conversion_prob,
                 key_prefix=f"{key_prefix}_base_prob",
             )
         with decay_col:
-            conversion_decay = beta_prob_picker(
+            conversion_decay = prob_dist_picker(
                 "Daily decay if not converted", conversion_decay, key_prefix=f"{key_prefix}_decay"
             )
 
-    return days_mean, base_conversion_prob, conversion_decay
+    return days_until_converted, base_conversion_prob, conversion_decay
 
 
 def pct_slider(

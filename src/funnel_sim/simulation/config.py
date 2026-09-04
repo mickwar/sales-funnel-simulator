@@ -74,6 +74,18 @@ COUNT_FAMILIES = (Family.POISSON, Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIF
 # distributions.sample_positive), never by clamping or shifting the distribution.
 DEAL_SIZE_FAMILIES = (Family.NORMAL, Family.GAMMA, Family.LOGNORMAL, Family.CONTINUOUS_UNIFORM)
 
+# Families for "average days until a lead converts" (Phase 1 feedback: "'Average days' should
+# have a selected discrete distribution like lead arrivals ... allow Negative Binomial and
+# Discrete Uniform"). Deliberately a subset of COUNT_FAMILIES, not the full set -- the feedback
+# names exactly these two.
+DAYS_UNTIL_CONVERTED_FAMILIES = (Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM)
+
+# Families for the two [0, 1]-domain "probability" parameters -- a lead's base conversion
+# probability and its daily decay factor. Beta was already the only option; Continuous Uniform on
+# [0, 1] was added per Phase 1 feedback ("Distributions should be selectable for Base conversion
+# and Daily decay. Include Beta (already there) as well as Continuous Uniform on [0, 1]").
+PROBABILITY_FAMILIES = (Family.BETA, Family.CONTINUOUS_UNIFORM)
+
 
 def validate_deal_size_spec(spec: ParamSpec) -> None:
     """Deal-size-specific validation beyond the generic per-family domain checks
@@ -119,6 +131,15 @@ def _default_conversion_decay() -> ParamSpec:
     return ParamSpec(Family.BETA, mean=0.8, variance=0.05**2)
 
 
+def _default_days_until_converted() -> ParamSpec:
+    # Negative Binomial, mean 5 days, variance 10 (a modest over-dispersion) -- Poisson was the
+    # original default (Phase 1 feedback: "Default to Poisson with a mean of 5"), but Poisson
+    # isn't one of the two families this parameter's own selector offers (see
+    # DAYS_UNTIL_CONVERTED_FAMILIES), so Negative Binomial with the same mean is the closest
+    # equivalent starting point.
+    return ParamSpec(Family.NEGATIVE_BINOMIAL, mean=5.0, variance=10.0)
+
+
 @dataclass
 class SimulationConfig:
     """Every statistical parameter that drives one run's data generation.
@@ -156,9 +177,10 @@ class SimulationConfig:
     # -- Per-lead conversion timing and probability (Phase 1 feedback): each Lead gets its own
     # draw of these three when it's generated (see generation.generate_day), not a single global
     # rate applied to every lead alike.
-    days_until_converted_mean: float = 5.0  # Poisson mean for how many days a lead has to
-    # convert before being closed as Unqualified; day 0 means it must convert the same day it's
-    # created (or be closed unqualified that same day).
+    days_until_converted: ParamSpec = field(default_factory=_default_days_until_converted)
+    # how many days a lead has to convert before being closed as Unqualified -- see
+    # DAYS_UNTIL_CONVERTED_FAMILIES. Day 0 means it must convert the same day it's created (or be
+    # closed unqualified that same day).
     base_conversion_prob: ParamSpec = field(default_factory=_default_base_conversion_prob)
     conversion_decay: ParamSpec = field(default_factory=_default_conversion_decay)
 
@@ -204,17 +226,30 @@ class SimulationConfig:
                 f"activity_type_mix weights must sum to 1.0, got {activity_mix_total:.6g}."
             )
 
-        if self.days_until_converted_mean < 0:
-            raise SimulationConfigError("days_until_converted_mean must be >= 0.")
-        if self.base_conversion_prob.family is not Family.BETA:
-            raise SimulationConfigError("base_conversion_prob must use the Beta distribution.")
-        if self.conversion_decay.family is not Family.BETA:
-            raise SimulationConfigError("conversion_decay must use the Beta distribution.")
+        if self.days_until_converted.family not in DAYS_UNTIL_CONVERTED_FAMILIES:
+            raise SimulationConfigError(
+                "days_until_converted must use one of "
+                f"({', '.join(f.value for f in DAYS_UNTIL_CONVERTED_FAMILIES)}), "
+                f"got {self.days_until_converted.family.value}."
+            )
+        if self.base_conversion_prob.family not in PROBABILITY_FAMILIES:
+            raise SimulationConfigError(
+                "base_conversion_prob must use one of "
+                f"({', '.join(f.value for f in PROBABILITY_FAMILIES)}), "
+                f"got {self.base_conversion_prob.family.value}."
+            )
+        if self.conversion_decay.family not in PROBABILITY_FAMILIES:
+            raise SimulationConfigError(
+                "conversion_decay must use one of "
+                f"({', '.join(f.value for f in PROBABILITY_FAMILIES)}), "
+                f"got {self.conversion_decay.family.value}."
+            )
 
         # Resolving each distribution also validates it — surfaces a DistributionConfigError
         # with the same clear, user-facing message the picker widget shows (PLAN.md section 4).
         self.lead_arrival.resolve()
         self.deal_size.resolve()
+        self.days_until_converted.resolve()
         self.base_conversion_prob.resolve()
         self.conversion_decay.resolve()
 
