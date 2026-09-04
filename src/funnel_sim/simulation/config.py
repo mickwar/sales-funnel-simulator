@@ -162,6 +162,6 @@ def default_config(seed: int = 42) -> SimulationConfig:
     return SimulationConfig(
         seed=seed,
         lead_arrival=ParamSpec(Family.POISSON, mean=20.0),
-        deal_size=ParamSpec(Family.NORMAL, mean=8_000.0, variance=3_000.0**2),
+        deal_size=ParamSpec(Family.NORMAL, mean=5_000.0, variance=200.0**2),
         base_close_prob=0.2,
     )

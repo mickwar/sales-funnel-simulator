@@ -2,6 +2,13 @@
 parameter this app currently exposes (Phase 1 UI feedback: "probably its own full page ... I
 want to see selections for each object, cleanly organized").
 
+Layout note (second round of feedback): related pickers sit side by side in a 2-column grid --
+Leads next to Deal size, Accounts next to Close probability -- with matching elements (name,
+distribution selection, parameter selection, preview chart) on the same row in each column. A
+single-parameter family (e.g. Poisson) leaves a blank spacer where its second parameter would
+go (see `widgets._slider_placeholder`) rather than shortening its column, so the preview charts
+below stay lined up between columns.
+
 Streamlit auto-discovers this as a page because it lives in `app/pages/`, a sibling of the entry
 script (`app/main.py`). The leading `1_` controls its position in the sidebar nav; Streamlit
 strips numeric prefixes and underscores when it renders the label.
@@ -28,20 +35,20 @@ if "config" not in st.session_state:
     st.session_state.config = default_config()
 config = st.session_state.config
 
-st.header("Leads")
-lead_arrival = lead_arrival_picker(config.lead_arrival)
+leads_col, deal_size_col = st.columns(2)
+with leads_col:
+    lead_arrival = lead_arrival_picker(config.lead_arrival)
+with deal_size_col:
+    deal_size = deal_size_picker(config.deal_size)
 
 st.divider()
-st.header("Accounts")
-industry_mix = industry_mix_picker(config.industry_mix)
 
-st.divider()
-st.header("Deal size")
-deal_size = deal_size_picker(config.deal_size)
-
-st.divider()
-st.header("Close probability")
-base_close_prob = pct_slider("Base close probability", config.base_close_prob, key="base_close_prob")
+accounts_col, close_prob_col = st.columns(2)
+with accounts_col:
+    industry_mix = industry_mix_picker(config.industry_mix)
+with close_prob_col:
+    st.subheader("Close probability")
+    base_close_prob = pct_slider("Base close probability", config.base_close_prob, key="base_close_prob")
 
 st.session_state.config = replace(
     config,

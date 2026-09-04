@@ -30,13 +30,22 @@ from funnel_sim.simulation.distributions import (
     DISCRETE_FAMILIES,
     SINGLE_PARAMETER_FAMILIES,
     DistributionConfigError,
-    Family,
     moments_to_params,
     preview_xy,
 )
 from funnel_sim.simulation.entities import Industry
 
 from .formatting import humanize
+
+
+def _slider_placeholder() -> None:
+    """Reserve roughly the same vertical footprint as an `st.slider` (label + track) so a
+    single-parameter family (e.g. Poisson, with no variance control) doesn't leave its column
+    shorter than a two-parameter family's -- keeping side-by-side columns' rows (and, in turn,
+    their preview charts) lined up (Phase 1 feedback: "add a blank space for where a second
+    parameter would normally go").
+    """
+    st.markdown("<div style='height: 58px'></div>", unsafe_allow_html=True)
 
 
 def _render_preview(resolved, lower_bound: float | None = None) -> None:
@@ -74,6 +83,10 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
         list(COUNT_FAMILIES),
         format_func=lambda f: humanize(f.value),
         key=family_key,
+        help=(
+            "Poisson has one free parameter (variance always equals the mean). Negative "
+            "Binomial adds an independent variance control for over-dispersed counts."
+        ),
     )
 
     mean_key = f"{key_prefix}_mean"
@@ -86,12 +99,10 @@ def lead_arrival_picker(spec: ParamSpec, key_prefix: str = "lead_arrival") -> Pa
     if family in SINGLE_PARAMETER_FAMILIES:
         # Poisson has only one free parameter -- showing a variance control would imply it's
         # independently settable, which it isn't (Phase 1 feedback: "only give it the one
-        # parameter").
+        # parameter"). Leave a blank spacer in its place so this column's rows still line up
+        # with a two-parameter family's (e.g. deal size) in a side-by-side layout.
         variance = None
-        st.caption(
-            f"{humanize(family.value)} has only one free parameter -- its variance always "
-            "equals the mean."
-        )
+        _slider_placeholder()
     else:
         var_key = f"{key_prefix}_variance"
         default_variance = spec.variance if (spec.variance and spec.variance > spec.mean) else mean * 2 + 1.0
@@ -131,31 +142,34 @@ def deal_size_picker(spec: ParamSpec, key_prefix: str = "deal_size") -> ParamSpe
         list(DEAL_SIZE_FAMILIES),
         format_func=lambda f: humanize(f.value),
         key=family_key,
+        help=(
+            "Deal size has a hard $0 floor: Gamma/Lognormal are positive by construction, and "
+            "Normal enforces it by redrawing any value that lands at or below $0."
+        ),
     )
 
-    # Normal is the only offered family whose support extends below $0, so it's the only one
-    # whose mean slider needs to reach below $0 -- which is exactly what makes the "mean < $0"
-    # error (requested explicitly) reachable from the UI. Gamma/Lognormal already require a
-    # strictly positive mean, so their slider simply never offers an invalid value.
-    mean_lo = -50_000.0 if family is Family.NORMAL else 1.0
+    # Hard $0 floor, structurally: the mean slider itself never offers a value at or below $0 --
+    # for any of the three families, not just Normal -- rather than allowing the selection and
+    # catching it with an error afterward (Phase 1 feedback: "Don't let the user even select
+    # below that").
     mean_key = f"{key_prefix}_mean"
     if mean_key not in st.session_state:
-        st.session_state[mean_key] = float(np.clip(spec.mean, mean_lo, 250_000.0))
-    st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], mean_lo, 250_000.0))
+        st.session_state[mean_key] = float(np.clip(spec.mean, 50.0, 10_000.0))
+    st.session_state[mean_key] = float(np.clip(st.session_state[mean_key], 50.0, 10_000.0))
     mean = st.slider(
-        "Mean", min_value=mean_lo, max_value=250_000.0, step=500.0, format="$%.0f", key=mean_key
+        "Mean", min_value=50.0, max_value=10_000.0, step=50.0, format="$%.0f", key=mean_key
     )
 
     std_key = f"{key_prefix}_std"
-    default_std = float(np.sqrt(spec.variance)) if spec.variance else 3_000.0
+    default_std = float(np.sqrt(spec.variance)) if spec.variance else 200.0
     if std_key not in st.session_state:
-        st.session_state[std_key] = float(np.clip(default_std, 1.0, 100_000.0))
-    st.session_state[std_key] = float(np.clip(st.session_state[std_key], 1.0, 100_000.0))
+        st.session_state[std_key] = float(np.clip(default_std, 1.0, 500.0))
+    st.session_state[std_key] = float(np.clip(st.session_state[std_key], 1.0, 500.0))
     std = st.slider(
         "Standard deviation",
         min_value=1.0,
-        max_value=100_000.0,
-        step=100.0,
+        max_value=500.0,
+        step=1.0,
         format="$%.0f",
         key=std_key,
     )
