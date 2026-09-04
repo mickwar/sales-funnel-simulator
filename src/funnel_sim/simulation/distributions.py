@@ -37,14 +37,21 @@ class Family(str, Enum):
     POISSON = "poisson"
     LOGNORMAL = "lognormal"
     NEGATIVE_BINOMIAL = "negative_binomial"
+    DISCRETE_UNIFORM = "discrete_uniform"
+    CONTINUOUS_UNIFORM = "continuous_uniform"
 
 
 # Families whose support is the non-negative integers (pmf, not pdf; discrete preview x-axis).
-DISCRETE_FAMILIES = frozenset({Family.POISSON, Family.NEGATIVE_BINOMIAL})
+DISCRETE_FAMILIES = frozenset({Family.POISSON, Family.NEGATIVE_BINOMIAL, Family.DISCRETE_UNIFORM})
 
 # Families with only one free parameter -- variance isn't a meaningful independent input (PLAN.md
 # section 4: Poisson forces variance == mean). The UI hides the variance control for these.
 SINGLE_PARAMETER_FAMILIES = frozenset({Family.POISSON})
+
+# Families parameterized directly by their two endpoints rather than by mean/variance -- see
+# `uniform_from_bounds` below. The UI shows a "Low"/"High" pair instead of "Mean"/"Variance" for
+# these (Phase 1 feedback: "the two parameters should be the left and right endpoints").
+UNIFORM_FAMILIES = frozenset({Family.DISCRETE_UNIFORM, Family.CONTINUOUS_UNIFORM})
 
 
 @dataclass(frozen=True)
@@ -165,8 +172,69 @@ def moments_to_params(family: Family, mean: float, variance: float | None) -> Di
     )
 
 
+def uniform_from_bounds(family: Family, low: float | None, high: float | None) -> DistributionResult:
+    """Build a Discrete- or Continuous-Uniform distribution directly from its two endpoints,
+    rather than via method-of-moments: a Uniform is already fully determined by (low, high), so
+    asking for "mean and variance" instead would just make the user do that low/high -> mean/
+    variance conversion in their head (Phase 1 feedback: "the two parameters should be the left
+    and right endpoints").
+
+    Mirrors `moments_to_params`'s contract: returns the same `DistributionResult` shape (so
+    `preview_xy`/`sample_positive`/etc. all work unmodified), and raises DistributionConfigError
+    -- never silently clamps -- for an out-of-domain (low, high).
+    """
+    family = Family(family)
+    _require(
+        low is not None and high is not None,
+        f"{family.value}: both a low and a high endpoint are required.",
+    )
+    _require(high > low, f"{family.value}: high ({high!r}) must be greater than low ({low!r}).")
+
+    if family is Family.DISCRETE_UNIFORM:
+        lo_i, hi_i = int(round(low)), int(round(high))
+        _require(
+            hi_i > lo_i,
+            f"{family.value}: high and low must differ by at least 1 once rounded to whole numbers.",
+        )
+        dist = stats.randint(lo_i, hi_i + 1)  # scipy randint's high is exclusive -- +1 keeps hi_i.
+        native_params = {"low": float(lo_i), "high": float(hi_i)}
+    elif family is Family.CONTINUOUS_UNIFORM:
+        dist = stats.uniform(loc=float(low), scale=float(high - low))
+        native_params = {"low": float(low), "high": float(high)}
+    else:  # pragma: no cover - only called for the two Uniform families
+        raise DistributionConfigError(f"{family!r} is not a uniform family.")
+
+    return DistributionResult(
+        family=family,
+        mean=float(dist.mean()),
+        variance=float(dist.var()),
+        native_params=native_params,
+        dist=dist,
+        warnings=(),
+    )
+
+
+_BETA_PDF_EPS = 1e-3  # keeps a near-0/near-1 alpha or beta < 1 from plotting as +inf.
+
+
+def _pdf_values(result: DistributionResult, x: np.ndarray) -> np.ndarray:
+    """`result.dist.pdf(x)`, except for Beta: the x actually handed to scipy is first clamped to
+    [0.001, 0.999] (Phase 1 feedback: "do hard limits on the pdf calculation to avoid near
+    infinity values. Only calculate within [0.001, 0.999]"). A Beta with alpha or beta < 1 has a
+    pdf that genuinely diverges approaching 0 or 1; clamping only the *evaluated* x keeps the
+    plotted curve finite everywhere without touching the x-axis the caller displays (which can --
+    and, for Beta, always does -- still show the full [0, 1] range).
+    """
+    if result.family is Family.BETA:
+        x = np.clip(x, _BETA_PDF_EPS, 1.0 - _BETA_PDF_EPS)
+    return result.dist.pdf(x)
+
+
 def preview_xy(
-    result: DistributionResult, n_points: int = 200, lower_bound: float | None = None
+    result: DistributionResult,
+    n_points: int = 200,
+    lower_bound: float | None = None,
+    fixed_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build (x, y) arrays for the distribution-picker preview plot (PLAN.md section 7).
 
@@ -174,25 +242,44 @@ def preview_xy(
     return a pmf evaluated at each integer in range, which the UI should render as a bar/stem
     plot rather than a line.
 
-    `lower_bound`, when given, previews the *truncated-and-renormalized* density on
-    [lower_bound, hi) instead -- the same density `sample_positive` draws from when it rejects
-    and redraws values at or below that bound. For a family whose support is already entirely
-    above `lower_bound` (Gamma, Lognormal with lower_bound=0) this is identical to the
-    untruncated preview; it only actually reshapes the curve for a family like Normal whose
-    support extends below the bound.
+    `fixed_range`, when given, replaces the adaptive percentile-based x-range entirely with an
+    explicit (lo, hi) -- e.g. a Uniform family always previews across its own fixed endpoints
+    (lead arrival's [0, 100], deal size's [$50, $10,000]) regardless of the chosen Low/High, and
+    a [0, 1]-domain probability picker (Beta or Uniform(0, 1)) always previews [0, 1] (Phase 1
+    feedback: "the plots should have fixed left and right end points for the boundaries I've
+    given"). Mutually exclusive with `lower_bound` in practice -- nothing currently combines a
+    fixed display range with a truncated/renormalized preview.
+
+    `lower_bound`, when given (and `fixed_range` is not), previews the *truncated-and-
+    renormalized* density on [lower_bound, hi) instead -- the same density `sample_positive`
+    draws from when it rejects and redraws values at or below that bound. For a family whose
+    support is already entirely above `lower_bound` (Gamma, Lognormal with lower_bound=0) this is
+    identical to the untruncated preview; it only actually reshapes the curve for a family like
+    Normal whose support extends below the bound.
     """
     dist = result.dist
+
     if result.family in DISCRETE_FAMILIES:
-        hi = int(dist.ppf(0.999))
-        hi = max(hi, int(np.ceil(dist.mean())) + 1)
-        x = np.arange(0, hi + 1)
+        if fixed_range is not None:
+            lo, hi = fixed_range
+            x = np.arange(int(round(lo)), int(round(hi)) + 1)
+        else:
+            hi = int(dist.ppf(0.999))
+            hi = max(hi, int(np.ceil(dist.mean())) + 1)
+            x = np.arange(0, hi + 1)
         y = dist.pmf(x)
+        return x, y
+
+    if fixed_range is not None:
+        lo, hi = fixed_range
+        x = np.linspace(lo, hi, n_points)
+        y = _pdf_values(result, x)
         return x, y
 
     if lower_bound is None:
         lo, hi = dist.ppf(0.001), dist.ppf(0.999)
         x = np.linspace(lo, hi, n_points)
-        y = dist.pdf(x)
+        y = _pdf_values(result, x)
         return x, y
 
     survival = dist.sf(lower_bound)  # Pr(X > lower_bound) -- the truncated density's normalizer.

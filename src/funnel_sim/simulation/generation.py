@@ -1,5 +1,5 @@
-"""Vectorized, time-stepped data generation — the beginnings of the fast-forward engine
-(PLAN.md section 4 and section 10 Phase 1).
+"""Vectorized, time-stepped data generation — the fast-forward engine (PLAN.md section 4 and
+section 10 Phase 1).
 
 Per PLAN.md section 4: "fast forward N days" advances one daily tick at a time; within a tick,
 every statistical draw is generated as numpy arrays in one shot rather than looped row-by-row in
@@ -9,12 +9,31 @@ section 5). Constructing one entity object per generated row (to get each its ow
 Python-level loop below, but it does no sampling — every random draw happens once, vectorized,
 before that loop runs.
 
-Phase 1 scope, honestly stated: this module generates Accounts and Leads only, from
-`SimulationConfig.lead_arrival` and `.industry_mix` (§4's Poisson/Negative-Binomial arrival
-process). Task/Opportunity generation — sampling task outcomes and close probability through the
-effects system (§4, §6) — is the next Phase 1 increment; `SimulationConfig.deal_size`,
-`.base_close_prob`, `.industry_effects`, and `.rep_skill_effects` are defined already (see
-config.py) so that next step doesn't require reshaping the config.
+Two things happen each simulated day, in order:
+
+1. `generate_day` — new Leads (and their Accounts) arrive, from `SimulationConfig.lead_arrival`
+   and `.industry_mix` (§4's arrival process). Each new Lead also gets its own
+   `days_until_converted`, `base_conversion_prob`, `conversion_decay`, and `deal_size`, all drawn
+   once at creation (see `entities.Lead`'s docstring) rather than derived later from any
+   activity.
+2. `simulate_activities` — reps work the pool of already-open Leads (new ones included, the same
+   day they arrive): some get a randomized activity (call/email/meeting/text, from
+   `.activity_type_mix`), which nudges (not decides) that lead's conversion_prob via
+   `.task_type_effects`. *Every* open lead -- touched or not -- then gets a conversion attempt
+   against its own current conversion_prob (Phase 1 feedback: "the chance of a lead being
+   converted should not depend on the outcome of any particular activity"). A lead that doesn't
+   convert and has used up its `days_until_converted` allowance is closed DISQUALIFIED; one that
+   still has days left has its probability decayed (multiplicatively) for tomorrow.
+
+`fast_forward` is what threads these together across many days, maintaining a leads-*current*
+projection (PLAN.md section 3: `<entity>_current` — one row per lead, upserted as its stage/
+probability changes) alongside the append-only Task/Opportunity logs.
+
+Honestly-stated scope for this increment: Rep capacity limits ("assign tasks up to each rep's
+remaining capacity", §4) aren't modeled — there's no Rep pool generated yet, so every Task's
+`actor_rep_id` is `None` and `activity_prob` applies uniformly rather than being capacity-gated.
+Opportunities are created but never progressed past `PROSPECTING`/never closed — win/loss
+resolution, `industry_effects`, and `rep_skill_effects` are still the next increment.
 """
 
 from __future__ import annotations
@@ -26,7 +45,19 @@ import numpy as np
 import pandas as pd
 
 from .config import SimulationConfig
-from .entities import Account, Industry, Lead, LeadStage, RevenueBand
+from .distributions import sample_positive
+from .effects import Effect, apply_effects
+from .entities import (
+    Account,
+    Industry,
+    Lead,
+    LeadStage,
+    Opportunity,
+    RevenueBand,
+    Task,
+    TaskOutcome,
+    TaskType,
+)
 
 _ACCOUNT_COLUMNS = [
     "account_id",
@@ -48,7 +79,45 @@ _LEAD_COLUMNS = [
     "assigned_rep_id",
     "created_at_sim_day",
     "updated_at_sim_day",
+    "days_until_converted",
+    "base_conversion_prob",
+    "conversion_decay",
+    "conversion_prob",
+    "deal_size",
 ]
+
+_TASK_COLUMNS = [
+    "task_id",
+    "run_id",
+    "task_type",
+    "sim_day",
+    "lead_id",
+    "opportunity_id",
+    "actor_rep_id",
+    "outcome",
+]
+
+_OPPORTUNITY_COLUMNS = [
+    "opportunity_id",
+    "run_id",
+    "lead_id",
+    "account_id",
+    "deal_size",
+    "created_at_sim_day",
+    "stage",
+    "probability",
+    "expected_close_sim_day",
+    "assigned_rep_id",
+    "closed_at_sim_day",
+    "won",
+]
+
+_LEAD_UPDATE_COLUMNS = ["lead_id", "stage", "updated_at_sim_day", "conversion_prob"]
+
+# Leads in either of these stages are done -- not eligible for another day's activity/conversion
+# attempt. CONVERTED means an Opportunity now exists for it; DISQUALIFIED means it ran out its
+# days_until_converted allowance without converting (see `simulate_activities`).
+_TERMINAL_LEAD_STAGES = frozenset({LeadStage.CONVERTED.value, LeadStage.DISQUALIFIED.value})
 
 # Employee count and ICP-fit are sampled from fixed, coarse distributions for Phase 1 — not yet
 # user-configurable. Revisit alongside PLAN.md section 12's "seeded realistic defaults" question
@@ -63,6 +132,16 @@ _REVENUE_BANDS = tuple(RevenueBand)
 # band to actually respond to the sampled employee count rather than being drawn independently.
 _REVENUE_BAND_WEIGHTS = (0.5, 0.3, 0.15, 0.05)
 
+# Of the activities that *don't* happen to convert their lead the same day, the share that at
+# least connects with the person (TaskOutcome.CONNECTED) rather than going unanswered
+# (NO_RESPONSE) -- a fixed internal constant for this increment, like _EMPLOYEE_COUNT_MEAN
+# above, not yet its own config knob.
+_TASK_OUTCOME_CONNECT_SHARE = 0.5
+
+# Effect.logit_delta looked up for a task type with no entry in config.task_type_effects -- 0.0
+# shift, i.e. "no configured effect yet" (SimulationConfig.task_type_effects's default).
+_ZERO_EFFECT = Effect(name="none", logit_delta=0.0)
+
 
 def _empty_frame(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame({col: pd.Series(dtype="object") for col in columns})
@@ -70,8 +149,8 @@ def _empty_frame(columns: list[str]) -> pd.DataFrame:
 
 @dataclass(frozen=True)
 class DayResult:
-    """One simulated day's worth of newly-generated entities, as DataFrames (one row per
-    entity) with columns matching `entities.Account`/`entities.Lead` field names 1:1 — that
+    """One simulated day's worth of newly-*arrived* entities, as DataFrames (one row per entity)
+    with columns matching `entities.Account`/`entities.Lead` field names 1:1 — that
     correspondence is what makes bulk-loading these into Postgres (PLAN.md section 5) a direct
     column mapping rather than a translation layer.
 
@@ -85,12 +164,40 @@ class DayResult:
 
 
 @dataclass(frozen=True)
-class FastForwardResult:
-    """The concatenated output of fast-forwarding a SimulationConfig for a number of days.
+class ActivityResult:
+    """One simulated day's worth of advancing an already-open pool of leads: every rep activity
+    performed as a `Task` row (whether or not its lead happened to convert the same day -- an
+    append-only event log, PLAN.md section 3), any `Opportunity` rows created by a lead
+    converting today, and `lead_updates` -- one row per *open* lead (touched or not -- every open
+    lead gets a conversion attempt and, if it survives, a decayed probability for tomorrow) with
+    its post-attempt stage, `conversion_prob`, and `updated_at_sim_day`, for the caller to upsert
+    into its leads-current projection.
 
-    `run_id` is the id every generated Account/Lead row carries (PLAN.md section 5's
-    multi-tenancy column) — a fresh one is minted per call unless the caller passes one in
-    (e.g. to keep generating into an existing Run/scenario).
+    Empty (no open leads) days still return DataFrames with the right columns, never `None` —
+    same rationale as `DayResult`.
+    """
+
+    sim_day: int
+    tasks: pd.DataFrame
+    opportunities: pd.DataFrame
+    lead_updates: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class FastForwardResult:
+    """The output of fast-forwarding a SimulationConfig for a number of days.
+
+    `run_id` is the id every generated row carries (PLAN.md section 5's multi-tenancy column) —
+    a fresh one is minted per call unless the caller passes one in (e.g. to keep generating into
+    an existing Run/scenario).
+
+    `accounts`, `tasks`, and `opportunities` are append-only logs (every row ever generated,
+    across every day of this call); `leads` is a *current-state projection* instead — one row per
+    lead, reflecting its latest stage/`conversion_prob`/`updated_at_sim_day` after every day's
+    activity, not a per-day history (PLAN.md section 3's `<entity>_current` pattern). Pass this
+    call's `.leads` back in as `fast_forward`'s `existing_leads` to continue the same projection
+    into a later call rather than losing track of which leads are already open/converted/
+    disqualified.
     """
 
     days: int
@@ -98,6 +205,8 @@ class FastForwardResult:
     run_id: str
     accounts: pd.DataFrame
     leads: pd.DataFrame
+    tasks: pd.DataFrame
+    opportunities: pd.DataFrame
 
 
 def generate_day(
@@ -105,8 +214,12 @@ def generate_day(
 ) -> DayResult:
     """Generate one day's new Accounts and Leads (one Account per new Lead, for now — see
     module docstring) by sampling `config.lead_arrival` for a count, then drawing that many
-    industries from `config.industry_mix` and employee counts / ICP-fit scores from fixed
-    distributions, all in one vectorized pass (no per-lead sampling loop).
+    industries from `config.industry_mix`, employee counts / ICP-fit scores from fixed
+    distributions, and each new Lead's own `days_until_converted` (`config.
+    days_until_converted`), `base_conversion_prob` (`config.base_conversion_prob`),
+    `conversion_decay` (`config.conversion_decay`), and `deal_size` (`config.deal_size`, floored
+    at $0 via `distributions.sample_positive` the same way the Configure Parameters preview
+    promises) -- all in one vectorized pass (no per-lead sampling loop).
     """
     arrival_dist = config.lead_arrival.resolve().dist
     n_new = max(int(arrival_dist.rvs(random_state=rng)), 0)
@@ -127,6 +240,16 @@ def generate_day(
     revenue_bands = rng.choice(
         np.array([b.value for b in _REVENUE_BANDS]), size=n_new, p=_REVENUE_BAND_WEIGHTS
     )
+
+    # Each new Lead's own conversion trajectory -- drawn once here, never resampled later (see
+    # entities.Lead's docstring and this module's docstring).
+    days_until_converted_dist = config.days_until_converted.resolve().dist
+    days_until_converted = np.maximum(
+        np.round(days_until_converted_dist.rvs(size=n_new, random_state=rng)), 0
+    ).astype(int)
+    base_conversion_probs = config.base_conversion_prob.resolve().dist.rvs(size=n_new, random_state=rng)
+    conversion_decays = config.conversion_decay.resolve().dist.rvs(size=n_new, random_state=rng)
+    deal_sizes = sample_positive(config.deal_size.resolve(), size=n_new, rng=rng)
 
     # One Account + one Lead per new-lead draw. Building the entity objects (for their ids) is
     # a Python-level loop, but every value going into it was already sampled above in bulk —
@@ -151,6 +274,11 @@ def generate_day(
                 created_at_sim_day=sim_day,
                 stage=LeadStage.NEW,
                 source="generated",
+                days_until_converted=int(days_until_converted[i]),
+                base_conversion_prob=float(base_conversion_probs[i]),
+                conversion_decay=float(conversion_decays[i]),
+                conversion_prob=float(base_conversion_probs[i]),
+                deal_size=float(deal_sizes[i]),
             )
         )
 
@@ -176,10 +304,192 @@ def generate_day(
             "assigned_rep_id": [l.assigned_rep_id for l in leads],
             "created_at_sim_day": [l.created_at_sim_day for l in leads],
             "updated_at_sim_day": [l.updated_at_sim_day for l in leads],
+            "days_until_converted": [l.days_until_converted for l in leads],
+            "base_conversion_prob": [l.base_conversion_prob for l in leads],
+            "conversion_decay": [l.conversion_decay for l in leads],
+            "conversion_prob": [l.conversion_prob for l in leads],
+            "deal_size": [l.deal_size for l in leads],
         }
     )
 
     return DayResult(sim_day=sim_day, accounts=accounts_df, leads=leads_df)
+
+
+def simulate_activities(
+    config: SimulationConfig,
+    sim_day: int,
+    rng: np.random.Generator,
+    run_id: str,
+    open_leads: pd.DataFrame,
+) -> ActivityResult:
+    """Advance every currently-open lead by one simulated day.
+
+    For each open lead: roll whether it gets a rep activity today (`config.activity_prob`), and
+    if so, which `TaskType` the activity is (`config.activity_type_mix`) -- that activity type's
+    configured effect (`config.task_type_effects`, 0.0 if none configured yet) nudges the lead's
+    conversion_prob in logit space via the same `effects.apply_effects` composition every other
+    probability in this app goes through. Then -- touched or not -- every open lead gets a
+    conversion attempt against its own (possibly just-nudged) conversion_prob: whether a lead
+    converts never depends on which activity, if any, happened to it today, only on its current
+    probability (Phase 1 feedback: "the chance of a lead being converted should not depend on the
+    outcome of any particular activity").
+
+    A lead that doesn't convert and has now reached its `days_until_converted` age is closed
+    DISQUALIFIED (its last attempt was today). A lead that doesn't convert and still has days
+    left gets its probability decayed multiplicatively by its own `conversion_decay`, ready for
+    tomorrow. A touched lead that was NEW moves to CONTACTED (unless it converted or was
+    disqualified today instead); a lead whose attempt converts it moves to CONVERTED and gets a
+    new `Opportunity`, using the `deal_size` it was assigned when it was first generated (not a
+    fresh draw).
+
+    `open_leads` must carry `lead_id`, `account_id`, `stage`, `created_at_sim_day`,
+    `days_until_converted`, `conversion_decay`, `conversion_prob`, and `deal_size` (see
+    `fast_forward`, which builds this pool and decides what counts as "open").
+
+    Fully vectorized, like `generate_day`: every random draw happens once across the whole
+    `open_leads` pool, never per-row in a loop -- only building the Task/Opportunity objects
+    (for their ids) loops in Python, and does no sampling of its own.
+    """
+    if open_leads.empty:
+        return ActivityResult(
+            sim_day=sim_day,
+            tasks=_empty_frame(_TASK_COLUMNS),
+            opportunities=_empty_frame(_OPPORTUNITY_COLUMNS),
+            lead_updates=_empty_frame(_LEAD_UPDATE_COLUMNS),
+        )
+
+    n_open = len(open_leads)
+    lead_ids = open_leads["lead_id"].to_numpy()
+    account_ids = open_leads["account_id"].to_numpy()
+    current_stage = open_leads["stage"].to_numpy()
+    created_at = open_leads["created_at_sim_day"].to_numpy()
+    days_until_converted = open_leads["days_until_converted"].to_numpy()
+    conversion_decay = open_leads["conversion_decay"].to_numpy(dtype=float)
+    conversion_prob = open_leads["conversion_prob"].to_numpy(dtype=float)
+    deal_size = open_leads["deal_size"].to_numpy(dtype=float)
+
+    # Which leads get a rep activity today, and which task type each one is.
+    touched_mask = rng.random(n_open) < config.activity_prob
+    n_touched = int(touched_mask.sum())
+    sampled_types = np.full(n_open, "", dtype=object)
+    type_delta = np.zeros(n_open)
+    if n_touched > 0:
+        task_types = list(config.activity_type_mix.keys())
+        type_weights = np.array(list(config.activity_type_mix.values()), dtype=float)
+        type_weights = type_weights / type_weights.sum()  # defensive re-normalize, as generate_day.
+        touched_types = rng.choice(
+            np.array([t.value for t in task_types]), size=n_touched, p=type_weights
+        )
+        sampled_types[touched_mask] = touched_types
+        type_delta[touched_mask] = [
+            config.task_type_effects.get(TaskType(t), _ZERO_EFFECT).logit_delta for t in touched_types
+        ]
+
+    # Today's effective probability: yesterday's stored value, nudged by today's activity (0
+    # shift for an untouched lead) -- this is what both today's conversion roll AND tomorrow's
+    # starting point (after decay, below) are based on.
+    effective_prob = apply_effects(conversion_prob, (type_delta,))
+
+    # Every open lead gets a conversion attempt today, touched or not -- this is the whole point
+    # of decoupling conversion from any one activity's outcome.
+    converts = rng.random(n_open) < effective_prob
+
+    age = sim_day - created_at
+    expired = (~converts) & (age >= days_until_converted)
+    still_open = ~converts & ~expired
+
+    new_stage = current_stage.copy()
+    new_stage[converts] = LeadStage.CONVERTED.value
+    new_stage[expired] = LeadStage.DISQUALIFIED.value
+    became_contacted = still_open & touched_mask & (current_stage == LeadStage.NEW.value)
+    new_stage[became_contacted] = LeadStage.CONTACTED.value
+
+    next_prob = effective_prob.copy()
+    next_prob[still_open] = effective_prob[still_open] * conversion_decay[still_open]
+
+    lead_updates = pd.DataFrame(
+        {
+            "lead_id": lead_ids,
+            "stage": new_stage,
+            "updated_at_sim_day": sim_day,
+            "conversion_prob": next_prob,
+        }
+    )
+
+    if n_touched == 0:
+        tasks_df = _empty_frame(_TASK_COLUMNS)
+    else:
+        touched_idx = np.flatnonzero(touched_mask)
+        # Of today's touched leads, split non-converting ones between "connected" and "no
+        # response" for believable Task variety (Phase 1 fixed constant -- see
+        # _TASK_OUTCOME_CONNECT_SHARE above). A touched lead that happens to convert the same
+        # day still gets an ADVANCED task -- it's just no longer *why* it converted.
+        connects = rng.random(n_touched) < _TASK_OUTCOME_CONNECT_SHARE
+        converted_today = converts[touched_idx]
+        outcomes = np.where(
+            converted_today,
+            TaskOutcome.ADVANCED.value,
+            np.where(connects, TaskOutcome.CONNECTED.value, TaskOutcome.NO_RESPONSE.value),
+        )
+        tasks: list[Task] = [
+            Task(
+                run_id=run_id,
+                task_type=TaskType(sampled_types[i]),
+                sim_day=sim_day,
+                lead_id=str(lead_ids[i]),
+                outcome=TaskOutcome(outcomes[j]),
+            )
+            for j, i in enumerate(touched_idx)
+        ]
+        tasks_df = pd.DataFrame(
+            {
+                "task_id": [t.task_id for t in tasks],
+                "run_id": [t.run_id for t in tasks],
+                "task_type": [t.task_type.value for t in tasks],
+                "sim_day": [t.sim_day for t in tasks],
+                "lead_id": [t.lead_id for t in tasks],
+                "opportunity_id": [t.opportunity_id for t in tasks],
+                "actor_rep_id": [t.actor_rep_id for t in tasks],
+                "outcome": [t.outcome.value for t in tasks],
+            }
+        )
+
+    n_converted = int(converts.sum())
+    if n_converted == 0:
+        opportunities_df = _empty_frame(_OPPORTUNITY_COLUMNS)
+    else:
+        conv_idx = np.flatnonzero(converts)
+        opportunities: list[Opportunity] = [
+            Opportunity(
+                run_id=run_id,
+                lead_id=str(lead_ids[i]),
+                account_id=str(account_ids[i]),
+                deal_size=float(deal_size[i]),
+                created_at_sim_day=sim_day,
+                probability=config.base_close_prob,
+            )
+            for i in conv_idx
+        ]
+        opportunities_df = pd.DataFrame(
+            {
+                "opportunity_id": [o.opportunity_id for o in opportunities],
+                "run_id": [o.run_id for o in opportunities],
+                "lead_id": [o.lead_id for o in opportunities],
+                "account_id": [o.account_id for o in opportunities],
+                "deal_size": [o.deal_size for o in opportunities],
+                "created_at_sim_day": [o.created_at_sim_day for o in opportunities],
+                "stage": [o.stage.value for o in opportunities],
+                "probability": [o.probability for o in opportunities],
+                "expected_close_sim_day": [o.expected_close_sim_day for o in opportunities],
+                "assigned_rep_id": [o.assigned_rep_id for o in opportunities],
+                "closed_at_sim_day": [o.closed_at_sim_day for o in opportunities],
+                "won": [o.won for o in opportunities],
+            }
+        )
+
+    return ActivityResult(
+        sim_day=sim_day, tasks=tasks_df, opportunities=opportunities_df, lead_updates=lead_updates
+    )
 
 
 def fast_forward(
@@ -189,9 +499,12 @@ def fast_forward(
     seed: int | None = None,
     run_id: str | None = None,
     rng: np.random.Generator | None = None,
+    existing_leads: pd.DataFrame | None = None,
 ) -> FastForwardResult:
-    """Advance the simulation `days` daily ticks, starting at `start_day`, and return the
-    concatenated Accounts/Leads generated across all of them.
+    """Advance the simulation `days` daily ticks, starting at `start_day`: each day, new leads
+    arrive (`generate_day`) and every open lead gets a day of activity + a conversion attempt
+    (`simulate_activities`), and return the result across all of them (see `FastForwardResult`
+    for what's a full log vs. a current-state projection).
 
     By default, seeds a fresh `numpy.random.Generator` from `seed` (falling back to
     `config.seed` — PLAN.md section 11: "seed the RNG per run so a saved scenario can be
@@ -203,6 +516,16 @@ def fast_forward(
     stream already is, so repeated calls behave like one continuous simulation appending new days
     rather than replaying the same draws from scratch. When `rng` is given, `seed`/`config.seed`
     are ignored for this call (the Generator has already been seeded, by the caller, once).
+
+    Pass `existing_leads` (a prior call's `.leads`) alongside a continued `rng` for the same
+    reason: without it, this call's leads-current projection starts empty, so leads created by an
+    earlier call would never be eligible for activities/conversion here — silently
+    under-simulating a "continued" run rather than truly extending it. Continuing both together
+    is also what keeps the RNG-stream-splitting property other callers rely on
+    (`fast_forward(days=3); fast_forward(days=3)` sharing one `rng` matches one `fast_forward
+    (days=6)` call) exact: the number of random draws `simulate_activities` makes each day
+    depends on how many leads are open that day, so the two calls must see the same open-lead
+    pool a single 6-day call would have.
     """
     if days < 1:
         raise ValueError("days must be >= 1.")
@@ -211,16 +534,54 @@ def fast_forward(
         rng = np.random.default_rng(seed if seed is not None else config.seed)
     resolved_run_id = run_id if run_id is not None else str(uuid4())
     account_frames: list[pd.DataFrame] = []
-    lead_frames: list[pd.DataFrame] = []
+    task_frames: list[pd.DataFrame] = []
+    opportunity_frames: list[pd.DataFrame] = []
+    leads_current = existing_leads.copy() if existing_leads is not None else _empty_frame(_LEAD_COLUMNS)
+
+    open_columns = [
+        "lead_id",
+        "account_id",
+        "stage",
+        "created_at_sim_day",
+        "days_until_converted",
+        "conversion_decay",
+        "conversion_prob",
+        "deal_size",
+    ]
 
     for offset in range(days):
-        result = generate_day(config, start_day + offset, rng, resolved_run_id)
-        account_frames.append(result.accounts)
-        lead_frames.append(result.leads)
+        sim_day = start_day + offset
+
+        day_result = generate_day(config, sim_day, rng, resolved_run_id)
+        account_frames.append(day_result.accounts)
+        leads_current = pd.concat([leads_current, day_result.leads], ignore_index=True)
+
+        open_mask = ~leads_current["stage"].isin(_TERMINAL_LEAD_STAGES)
+        open_leads = leads_current.loc[open_mask, open_columns]
+        activity_result = simulate_activities(config, sim_day, rng, resolved_run_id, open_leads)
+        task_frames.append(activity_result.tasks)
+        opportunity_frames.append(activity_result.opportunities)
+
+        if not activity_result.lead_updates.empty:
+            updates = activity_result.lead_updates.set_index("lead_id")
+            leads_current = leads_current.set_index("lead_id")
+            leads_current.loc[updates.index, "stage"] = updates["stage"]
+            leads_current.loc[updates.index, "updated_at_sim_day"] = updates["updated_at_sim_day"]
+            leads_current.loc[updates.index, "conversion_prob"] = updates["conversion_prob"]
+            leads_current = leads_current.reset_index()[_LEAD_COLUMNS]
 
     accounts = pd.concat(account_frames, ignore_index=True) if account_frames else _empty_frame(_ACCOUNT_COLUMNS)
-    leads = pd.concat(lead_frames, ignore_index=True) if lead_frames else _empty_frame(_LEAD_COLUMNS)
+    tasks = pd.concat(task_frames, ignore_index=True) if task_frames else _empty_frame(_TASK_COLUMNS)
+    opportunities = (
+        pd.concat(opportunity_frames, ignore_index=True) if opportunity_frames else _empty_frame(_OPPORTUNITY_COLUMNS)
+    )
 
     return FastForwardResult(
-        days=days, start_day=start_day, run_id=resolved_run_id, accounts=accounts, leads=leads
+        days=days,
+        start_day=start_day,
+        run_id=resolved_run_id,
+        accounts=accounts,
+        leads=leads_current,
+        tasks=tasks,
+        opportunities=opportunities,
     )
