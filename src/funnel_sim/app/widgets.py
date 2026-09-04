@@ -38,6 +38,35 @@ from funnel_sim.simulation.entities import Industry
 from .formatting import humanize
 
 
+def inject_placeholder_css() -> None:
+    """One-time, *page-level* CSS injection that hides every `_slider_placeholder` widget below,
+    matched by a shared substring in their `key` (`_variance_placeholder`) rather than one exact
+    key, since more than one picker column can each render its own placeholder.
+
+    Must be called once from the page itself, before any `st.columns(...)` block that will
+    contain a placeholder -- NOT from inside `_slider_placeholder`. The first (pixel-height)
+    version of this fix injected the `<style>` tag via its own `st.markdown(...)` call sitting
+    right next to the hidden slider, inside that slider's own column -- which reserved the right
+    *height* but still misaligned the columns, because that markdown call is itself an extra
+    flex child in Streamlit's column layout, adding one extra inter-widget gap (~16px) to that
+    column alone that the sibling column never had. Injecting the rule once, above both columns,
+    keeps every column's child count (and therefore its gaps) identical.
+
+    The rule targets both the placeholder's container *and* every element inside it (`... *`),
+    with `!important` on both: Streamlit's own stylesheet explicitly sets its widget label back
+    to `visibility: visible` (for accessibility), which -- being a rule on the label itself, not
+    inherited from its hidden ancestor -- otherwise wins and leaves a stray "Variance" label
+    showing above the blank space.
+    """
+    st.markdown(
+        "<style>"
+        "[class*='_variance_placeholder'], [class*='_variance_placeholder'] * "
+        "{ visibility: hidden !important; }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+
+
 def _slider_placeholder(key: str) -> None:
     """Reserve *exactly* the vertical footprint an `st.slider` takes here, so a single-parameter
     family (e.g. Poisson, with no variance control) doesn't leave its column shorter than a
@@ -47,13 +76,12 @@ def _slider_placeholder(key: str) -> None:
 
     A hardcoded pixel height drifts out of sync with the real slider it's supposed to match
     (label wrapping, theme, Streamlit version). Instead, render an actual disabled `st.slider`
-    -- guaranteed identical layout to a real one -- and hide it with `visibility: hidden` rather
-    than `display: none`, which removes it from view without collapsing the space it reserves.
-    Passing `key=` gives the widget's wrapper a stable `st-key-<key>` CSS class (Streamlit
-    feature) to target.
+    -- guaranteed identical layout to a real one -- hidden with `visibility: hidden` rather than
+    `display: none` (which would collapse the space instead of reserving it) by the page-level
+    `inject_placeholder_css()` above. Passing `key=` gives the widget's wrapper a stable
+    `st-key-<key>` CSS class (Streamlit feature) for that rule to match.
     """
     st.slider("Variance", min_value=0.0, max_value=1.0, value=0.0, key=key, disabled=True)
-    st.markdown(f"<style>div.st-key-{key} {{ visibility: hidden; }}</style>", unsafe_allow_html=True)
 
 
 def _render_preview(resolved, lower_bound: float | None = None) -> None:

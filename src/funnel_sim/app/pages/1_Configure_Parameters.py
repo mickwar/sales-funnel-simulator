@@ -20,7 +20,13 @@ from dataclasses import replace
 
 import streamlit as st
 
-from funnel_sim.app.widgets import deal_size_picker, industry_mix_picker, lead_arrival_picker, pct_slider
+from funnel_sim.app.widgets import (
+    deal_size_picker,
+    industry_mix_picker,
+    inject_placeholder_css,
+    lead_arrival_picker,
+    pct_slider,
+)
 from funnel_sim.simulation.config import default_config
 
 st.set_page_config(page_title="Configure Parameters -- Sales Funnel Simulator", layout="wide")
@@ -34,6 +40,11 @@ st.caption(
 if "config" not in st.session_state:
     st.session_state.config = default_config()
 config = st.session_state.config
+
+# Must run before either st.columns() block below that might contain a single-parameter
+# family's placeholder slider -- see inject_placeholder_css's docstring for why this can't be
+# called from inside the column (or inside the picker) instead.
+inject_placeholder_css()
 
 leads_col, deal_size_col = st.columns(2)
 with leads_col:
