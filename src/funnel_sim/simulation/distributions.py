@@ -42,6 +42,10 @@ class Family(str, Enum):
 # Families whose support is the non-negative integers (pmf, not pdf; discrete preview x-axis).
 DISCRETE_FAMILIES = frozenset({Family.POISSON, Family.NEGATIVE_BINOMIAL})
 
+# Families with only one free parameter -- variance isn't a meaningful independent input (PLAN.md
+# section 4: Poisson forces variance == mean). The UI hides the variance control for these.
+SINGLE_PARAMETER_FAMILIES = frozenset({Family.POISSON})
+
 
 @dataclass(frozen=True)
 class DistributionResult:
@@ -161,12 +165,21 @@ def moments_to_params(family: Family, mean: float, variance: float | None) -> Di
     )
 
 
-def preview_xy(result: DistributionResult, n_points: int = 200) -> tuple[np.ndarray, np.ndarray]:
+def preview_xy(
+    result: DistributionResult, n_points: int = 200, lower_bound: float | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Build (x, y) arrays for the distribution-picker preview plot (PLAN.md section 7).
 
     Continuous families return a pdf curve; discrete families (Poisson, Negative Binomial)
     return a pmf evaluated at each integer in range, which the UI should render as a bar/stem
     plot rather than a line.
+
+    `lower_bound`, when given, previews the *truncated-and-renormalized* density on
+    [lower_bound, hi) instead -- the same density `sample_positive` draws from when it rejects
+    and redraws values at or below that bound. For a family whose support is already entirely
+    above `lower_bound` (Gamma, Lognormal with lower_bound=0) this is identical to the
+    untruncated preview; it only actually reshapes the curve for a family like Normal whose
+    support extends below the bound.
     """
     dist = result.dist
     if result.family in DISCRETE_FAMILIES:
@@ -176,7 +189,53 @@ def preview_xy(result: DistributionResult, n_points: int = 200) -> tuple[np.ndar
         y = dist.pmf(x)
         return x, y
 
-    lo, hi = dist.ppf(0.001), dist.ppf(0.999)
-    x = np.linspace(lo, hi, n_points)
-    y = dist.pdf(x)
+    if lower_bound is None:
+        lo, hi = dist.ppf(0.001), dist.ppf(0.999)
+        x = np.linspace(lo, hi, n_points)
+        y = dist.pdf(x)
+        return x, y
+
+    survival = dist.sf(lower_bound)  # Pr(X > lower_bound) -- the truncated density's normalizer.
+    _require(
+        survival > 1e-9,
+        f"{result.family.value}: virtually none of the distribution (mean={result.mean:.6g}) is "
+        f"above {lower_bound:.6g}, so there's nothing meaningful to preview.",
+    )
+    # hi such that the truncated CDF reaches 0.999: CDF(hi) = CDF(lower_bound) + 0.999*survival.
+    hi = dist.ppf(1 - 0.001 * survival)
+    x = np.linspace(lower_bound, hi, n_points)
+    y = dist.pdf(x) / survival
     return x, y
+
+
+def sample_positive(
+    result: DistributionResult,
+    size: int,
+    rng: np.random.Generator,
+    lower_bound: float = 0.0,
+    max_rounds: int = 100,
+) -> np.ndarray:
+    """Draw `size` values from `result.dist`, enforcing `x > lower_bound` by rejection sampling:
+    redraw (rather than clamp or discard-and-shrink) until `size` accepted values have been
+    collected. The accepted values are therefore genuinely distributed as the analytically
+    truncated distribution that `preview_xy(result, lower_bound=...)` previews -- not a clipped
+    or shifted approximation of it.
+
+    Converges quickly as long as a comfortable majority of the distribution's mass is already
+    above `lower_bound` (for deal size using Normal, PLAN's requirement that mean >= $0 and
+    therefore Pr(X > $0) > 0.5 is exactly what keeps this from stalling). Raises
+    DistributionConfigError if `max_rounds` batches still aren't enough -- a config that
+    shouldn't be reachable through `SimulationConfig.validate()`, but this stays safe on its own
+    rather than looping forever.
+    """
+    accepted = np.empty(0)
+    for _ in range(max_rounds):
+        draw = np.atleast_1d(result.dist.rvs(size=size, random_state=rng))
+        accepted = np.concatenate([accepted, draw[draw > lower_bound]])
+        if len(accepted) >= size:
+            return accepted[:size]
+    raise DistributionConfigError(
+        f"Could not draw {size} values above {lower_bound:.6g} for {result.family.value} "
+        f"(mean={result.mean:.6g}) after {max_rounds} rounds of resampling -- too little of the "
+        "distribution's mass is above the bound."
+    )
